@@ -11,6 +11,7 @@ define('UPLOAD_DIR', __DIR__ . '/uploads/');
 define('OUTPUT_DIR', __DIR__ . '/output/');
 define('TEMP_DIR', __DIR__ . '/temp/');
 define('CLEANUP_AGE', 3600); // delete files older than 1 hour
+define('DEBUG', true); // set to false in production
 
 // Create directories if they don't exist
 foreach ([UPLOAD_DIR, OUTPUT_DIR, TEMP_DIR] as $dir) {
@@ -35,8 +36,49 @@ cleanupDirectory(OUTPUT_DIR);
 cleanupDirectory(TEMP_DIR);
 
 // ======================== LOGGING ==============================
-function logError($msg) {
-    error_log("[PDF2DOCX] " . $msg);
+function logError($msg, $context = []) {
+    $log = "[PDF2DOCX] " . $msg;
+    if (!empty($context)) {
+        $log .= " | Context: " . json_encode($context);
+    }
+    error_log($log);
+    if (defined('DEBUG') && DEBUG) {
+        // In debug mode, we can also store in a file
+        file_put_contents(TEMP_DIR . 'debug.log', $log . PHP_EOL, FILE_APPEND);
+    }
+}
+
+// ======================== CHECK TOOLS ==========================
+function checkLibreOffice() {
+    $which = shell_exec('which libreoffice 2>/dev/null');
+    if (empty($which)) {
+        return false;
+    }
+    return true;
+}
+
+function checkPoppler() {
+    $which = shell_exec('which pdftotext 2>/dev/null');
+    if (empty($which)) {
+        return false;
+    }
+    return true;
+}
+
+function checkTesseract() {
+    $which = shell_exec('which tesseract 2>/dev/null');
+    if (empty($which)) {
+        return false;
+    }
+    return true;
+}
+
+function checkPdftoppm() {
+    $which = shell_exec('which pdftoppm 2>/dev/null');
+    if (empty($which)) {
+        return false;
+    }
+    return true;
 }
 
 // ======================== HANDLE ACTIONS =======================
@@ -66,6 +108,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
     $response = ['success' => false, 'message' => ''];
 
     try {
+        // Check if required tools are available
+        if (!checkLibreOffice() && !checkPoppler() && !checkTesseract()) {
+            throw new Exception('Conversion tools not installed. Please contact administrator.');
+        }
+
         $file = $_FILES['pdf_file'];
         if ($file['error'] !== UPLOAD_ERR_OK) {
             throw new Exception('Upload error: ' . $file['error']);
@@ -93,7 +140,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
         if (!move_uploaded_file($file['tmp_name'], $inputPath)) {
             throw new Exception('Failed to move uploaded file. Check permissions.');
         }
-        // Ensure file exists
         if (!file_exists($inputPath)) {
             throw new Exception('Uploaded file not found after move.');
         }
@@ -102,25 +148,26 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
         // 1. Attempt conversion with LibreOffice
         // ------------------------------------------------------------
         $converted = false;
-        $cmd = sprintf(
-            'libreoffice --headless --convert-to docx --outdir %s %s 2>&1',
-            escapeshellarg(OUTPUT_DIR),
-            escapeshellarg($inputPath)
-        );
-        exec($cmd, $output, $returnCode);
-        logError("LibreOffice return code: $returnCode, output: " . implode("\n", $output));
+        if (checkLibreOffice()) {
+            $cmd = sprintf(
+                'libreoffice --headless --convert-to docx --outdir %s %s 2>&1',
+                escapeshellarg(OUTPUT_DIR),
+                escapeshellarg($inputPath)
+            );
+            exec($cmd, $output, $returnCode);
+            logError("LibreOffice return code: $returnCode", ['output' => $output]);
 
-        // LibreOffice generates a file with same basename but .docx
-        if ($returnCode === 0 && file_exists($outputPath) && filesize($outputPath) > 0) {
-            $converted = true;
-        } else {
-            // Try to find if LibreOffice produced a file with a different name (sometimes adds suffix)
-            $possibleFiles = glob(OUTPUT_DIR . $baseName . '*.docx');
-            if (!empty($possibleFiles)) {
-                // Use the first one and rename to expected
-                $found = $possibleFiles[0];
-                if (rename($found, $outputPath)) {
-                    $converted = true;
+            if ($returnCode === 0) {
+                // LibreOffice may produce file with .docx extension, but sometimes adds suffix (e.g., .docx)
+                $possibleFiles = glob(OUTPUT_DIR . $baseName . '*.docx');
+                if (!empty($possibleFiles)) {
+                    $found = $possibleFiles[0];
+                    if ($found !== $outputPath) {
+                        rename($found, $outputPath);
+                    }
+                    if (file_exists($outputPath) && filesize($outputPath) > 0) {
+                        $converted = true;
+                    }
                 }
             }
         }
@@ -128,14 +175,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
         // ------------------------------------------------------------
         // 2. Fallback: text extraction with pdftotext (for text-based PDFs)
         // ------------------------------------------------------------
-        if (!$converted) {
+        if (!$converted && checkPoppler()) {
             $txtFile = TEMP_DIR . $baseName . '.txt';
             $cmd2 = sprintf('pdftotext -layout %s %s 2>&1', escapeshellarg($inputPath), escapeshellarg($txtFile));
             exec($cmd2, $out2, $ret2);
             logError("pdftotext return code: $ret2");
 
             if ($ret2 === 0 && file_exists($txtFile) && filesize($txtFile) > 100) {
-                // Create DOCX with extracted text
                 require_once __DIR__ . '/vendor/autoload.php';
                 $phpWord = new \PhpOffice\PhpWord\PhpWord();
                 $section = $phpWord->addSection();
@@ -146,35 +192,27 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
                 $objWriter->save($outputPath);
                 $converted = true;
                 @unlink($txtFile);
-            } else {
-                // ------------------------------------------------------------
-                // 3. Fallback: OCR for scanned PDFs (using pdftoppm + tesseract)
-                // ------------------------------------------------------------
-                // Check if pdftoppm exists
-                $pdftoppm = shell_exec('which pdftoppm');
-                if (empty($pdftoppm)) {
-                    throw new Exception('pdftoppm not found. Cannot OCR scanned PDF.');
-                }
-                // Create image directory
-                $imgDir = TEMP_DIR . $baseName . '_images/';
-                if (!is_dir($imgDir)) mkdir($imgDir, 0755, true);
+            }
+        }
 
-                // Convert PDF to images (PNG)
-                $cmd3 = sprintf(
-                    'pdftoppm -png %s %s 2>&1',
-                    escapeshellarg($inputPath),
-                    escapeshellarg($imgDir . 'page')
-                );
-                exec($cmd3, $out3, $ret3);
-                logError("pdftoppm return code: $ret3");
+        // ------------------------------------------------------------
+        // 3. Fallback: OCR for scanned PDFs (using pdftoppm + tesseract)
+        // ------------------------------------------------------------
+        if (!$converted && checkPdftoppm() && checkTesseract()) {
+            $imgDir = TEMP_DIR . $baseName . '_images/';
+            if (!is_dir($imgDir)) mkdir($imgDir, 0755, true);
 
-                if ($ret3 === 0) {
-                    // Find all images
-                    $images = glob($imgDir . 'page-*.png');
-                    if (empty($images)) {
-                        throw new Exception('No images generated from PDF for OCR.');
-                    }
-                    // OCR each image and concatenate text
+            $cmd3 = sprintf(
+                'pdftoppm -png %s %s 2>&1',
+                escapeshellarg($inputPath),
+                escapeshellarg($imgDir . 'page')
+            );
+            exec($cmd3, $out3, $ret3);
+            logError("pdftoppm return code: $ret3");
+
+            if ($ret3 === 0) {
+                $images = glob($imgDir . 'page-*.png');
+                if (!empty($images)) {
                     $ocrText = '';
                     foreach ($images as $img) {
                         $ocrCmd = sprintf('tesseract %s stdout 2>&1', escapeshellarg($img));
@@ -183,7 +221,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
                             $ocrText .= $ocrOut . "\n\n";
                         }
                     }
-                    // Clean up images
                     array_map('unlink', $images);
                     @rmdir($imgDir);
 
@@ -196,11 +233,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
                         $objWriter = \PhpOffice\PhpWord\IOFactory::createWriter($phpWord, 'Word2007');
                         $objWriter->save($outputPath);
                         $converted = true;
-                    } else {
-                        throw new Exception('OCR produced insufficient text. PDF may be corrupted.');
                     }
-                } else {
-                    throw new Exception('Failed to convert PDF to images for OCR.');
                 }
             }
         }
@@ -219,7 +252,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
 
     } catch (Exception $e) {
         $response['message'] = $e->getMessage();
-        logError("Error: " . $e->getMessage());
+        logError("Error: " . $e->getMessage(), ['trace' => $e->getTraceAsString()]);
+        if (defined('DEBUG') && DEBUG) {
+            $response['debug'] = $e->getTraceAsString();
+        }
     }
 
     echo json_encode($response);
