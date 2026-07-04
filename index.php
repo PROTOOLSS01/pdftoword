@@ -2,7 +2,7 @@
 /**
  * index.php
  * Production-ready PDF to Word Converter
- * Handles upload, conversion (LibreOffice + fallback), preview, download and cleanup.
+ * Primary: LibreOffice conversion, fallback: text extraction/OCR.
  */
 
 // ======================== CONFIGURATION ========================
@@ -26,13 +26,18 @@ function cleanupDirectory($dir) {
     $now = time();
     foreach ($files as $file) {
         if (is_file($file) && ($now - filemtime($file)) > CLEANUP_AGE) {
-            unlink($file);
+            @unlink($file);
         }
     }
 }
 cleanupDirectory(UPLOAD_DIR);
 cleanupDirectory(OUTPUT_DIR);
 cleanupDirectory(TEMP_DIR);
+
+// ======================== LOGGING ==============================
+function logError($msg) {
+    error_log("[PDF2DOCX] " . $msg);
+}
 
 // ======================== HANDLE ACTIONS =======================
 $action = isset($_GET['action']) ? $_GET['action'] : '';
@@ -47,8 +52,8 @@ if ($action === 'download' && isset($_GET['file'])) {
         readfile($filePath);
         // Delete both the converted file and the original PDF after download
         $pdfFile = str_replace('.docx', '.pdf', $filePath);
-        if (file_exists($pdfFile)) unlink($pdfFile);
-        unlink($filePath);
+        if (file_exists($pdfFile)) @unlink($pdfFile);
+        @unlink($filePath);
         exit;
     } else {
         http_response_code(404);
@@ -68,6 +73,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
         if ($file['size'] > MAX_FILE_SIZE) {
             throw new Exception('File exceeds maximum size of 100 MB.');
         }
+        // Validate MIME using finfo
         $finfo = finfo_open(FILEINFO_MIME_TYPE);
         $mime = finfo_file($finfo, $file['tmp_name']);
         finfo_close($finfo);
@@ -82,10 +88,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
         $baseName = uniqid('pdf_', true);
         $inputPath = UPLOAD_DIR . $baseName . '.pdf';
         $outputPath = OUTPUT_DIR . $baseName . '.docx';
-        $fallbackOutputPath = OUTPUT_DIR . $baseName . '_fallback.docx';
 
+        // Move uploaded file
         if (!move_uploaded_file($file['tmp_name'], $inputPath)) {
-            throw new Exception('Failed to move uploaded file.');
+            throw new Exception('Failed to move uploaded file. Check permissions.');
+        }
+        // Ensure file exists
+        if (!file_exists($inputPath)) {
+            throw new Exception('Uploaded file not found after move.');
         }
 
         // ------------------------------------------------------------
@@ -98,46 +108,106 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
             escapeshellarg($inputPath)
         );
         exec($cmd, $output, $returnCode);
+        logError("LibreOffice return code: $returnCode, output: " . implode("\n", $output));
 
         // LibreOffice generates a file with same basename but .docx
-        if ($returnCode === 0 && file_exists($outputPath)) {
+        if ($returnCode === 0 && file_exists($outputPath) && filesize($outputPath) > 0) {
             $converted = true;
+        } else {
+            // Try to find if LibreOffice produced a file with a different name (sometimes adds suffix)
+            $possibleFiles = glob(OUTPUT_DIR . $baseName . '*.docx');
+            if (!empty($possibleFiles)) {
+                // Use the first one and rename to expected
+                $found = $possibleFiles[0];
+                if (rename($found, $outputPath)) {
+                    $converted = true;
+                }
+            }
         }
 
         // ------------------------------------------------------------
-        // 2. Fallback: if LibreOffice failed, extract text with pdftotext
-        //    and create a DOCX using PHPWord
+        // 2. Fallback: text extraction with pdftotext (for text-based PDFs)
         // ------------------------------------------------------------
         if (!$converted) {
             $txtFile = TEMP_DIR . $baseName . '.txt';
             $cmd2 = sprintf('pdftotext -layout %s %s 2>&1', escapeshellarg($inputPath), escapeshellarg($txtFile));
             exec($cmd2, $out2, $ret2);
+            logError("pdftotext return code: $ret2");
 
-            if ($ret2 === 0 && file_exists($txtFile) && filesize($txtFile) > 0) {
-                // Use PHPWord to create a DOCX
+            if ($ret2 === 0 && file_exists($txtFile) && filesize($txtFile) > 100) {
+                // Create DOCX with extracted text
                 require_once __DIR__ . '/vendor/autoload.php';
                 $phpWord = new \PhpOffice\PhpWord\PhpWord();
                 $section = $phpWord->addSection();
                 $text = file_get_contents($txtFile);
-                // Convert text to UTF-8 if needed
                 $text = mb_convert_encoding($text, 'UTF-8', 'auto');
                 $section->addText($text);
                 $objWriter = \PhpOffice\PhpWord\IOFactory::createWriter($phpWord, 'Word2007');
-                $objWriter->save($fallbackOutputPath);
-                // Rename to expected output
-                rename($fallbackOutputPath, $outputPath);
+                $objWriter->save($outputPath);
                 $converted = true;
-                unlink($txtFile);
+                @unlink($txtFile);
             } else {
-                // If pdftotext fails too, we cannot convert
-                if (file_exists($inputPath)) unlink($inputPath);
-                throw new Exception('Conversion failed. Neither LibreOffice nor text extraction could process this PDF.');
+                // ------------------------------------------------------------
+                // 3. Fallback: OCR for scanned PDFs (using pdftoppm + tesseract)
+                // ------------------------------------------------------------
+                // Check if pdftoppm exists
+                $pdftoppm = shell_exec('which pdftoppm');
+                if (empty($pdftoppm)) {
+                    throw new Exception('pdftoppm not found. Cannot OCR scanned PDF.');
+                }
+                // Create image directory
+                $imgDir = TEMP_DIR . $baseName . '_images/';
+                if (!is_dir($imgDir)) mkdir($imgDir, 0755, true);
+
+                // Convert PDF to images (PNG)
+                $cmd3 = sprintf(
+                    'pdftoppm -png %s %s 2>&1',
+                    escapeshellarg($inputPath),
+                    escapeshellarg($imgDir . 'page')
+                );
+                exec($cmd3, $out3, $ret3);
+                logError("pdftoppm return code: $ret3");
+
+                if ($ret3 === 0) {
+                    // Find all images
+                    $images = glob($imgDir . 'page-*.png');
+                    if (empty($images)) {
+                        throw new Exception('No images generated from PDF for OCR.');
+                    }
+                    // OCR each image and concatenate text
+                    $ocrText = '';
+                    foreach ($images as $img) {
+                        $ocrCmd = sprintf('tesseract %s stdout 2>&1', escapeshellarg($img));
+                        $ocrOut = shell_exec($ocrCmd);
+                        if ($ocrOut !== null) {
+                            $ocrText .= $ocrOut . "\n\n";
+                        }
+                    }
+                    // Clean up images
+                    array_map('unlink', $images);
+                    @rmdir($imgDir);
+
+                    if (strlen(trim($ocrText)) > 10) {
+                        require_once __DIR__ . '/vendor/autoload.php';
+                        $phpWord = new \PhpOffice\PhpWord\PhpWord();
+                        $section = $phpWord->addSection();
+                        $text = mb_convert_encoding($ocrText, 'UTF-8', 'auto');
+                        $section->addText($text);
+                        $objWriter = \PhpOffice\PhpWord\IOFactory::createWriter($phpWord, 'Word2007');
+                        $objWriter->save($outputPath);
+                        $converted = true;
+                    } else {
+                        throw new Exception('OCR produced insufficient text. PDF may be corrupted.');
+                    }
+                } else {
+                    throw new Exception('Failed to convert PDF to images for OCR.');
+                }
             }
         }
 
-        if (!$converted || !file_exists($outputPath)) {
-            if (file_exists($inputPath)) unlink($inputPath);
-            throw new Exception('Conversion output not found.');
+        if (!$converted || !file_exists($outputPath) || filesize($outputPath) < 100) {
+            if (file_exists($inputPath)) @unlink($inputPath);
+            throw new Exception('Conversion failed. Could not produce a valid DOCX file.');
         }
 
         // Return success
@@ -149,6 +219,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
 
     } catch (Exception $e) {
         $response['message'] = $e->getMessage();
+        logError("Error: " . $e->getMessage());
     }
 
     echo json_encode($response);
@@ -160,20 +231,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
 <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <!-- Favicon -->
     <link rel="icon" type="image/png" href="https://i.ibb.co/FkJPMZ8r/Chat-GPT-Image-Jun-18-2026-07-58-22-AM.png" />
     <link rel="shortcut icon" href="https://i.ibb.co/FkJPMZ8r/Chat-GPT-Image-Jun-18-2026-07-58-22-AM.png" />
     <title>PDF to Word Converter | ProToolss</title>
     <meta name="description" content="Convert PDF to editable Word documents instantly. Free and secure." />
-    <!-- Font Awesome -->
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" />
-    <!-- Google Font: Poppins -->
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700;800&display=swap" rel="stylesheet" />
 
     <style>
-        /* ===== RESET & BASE ===== */
         * {
             margin: 0;
             padding: 0;
@@ -196,7 +263,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
             padding: 0 28px;
         }
 
-        /* ===== NAVIGATION (from new navbar) ===== */
         nav {
             position: fixed;
             top: 0;
@@ -335,7 +401,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
             padding-left: 8px;
         }
 
-        /* ===== FOOTER ===== */
         footer {
             margin-top: 60px;
             padding: 30px 0;
@@ -370,7 +435,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
             margin: 0 6px;
         }
 
-        /* ===== RESPONSIVE NAV/FOOTER ===== */
         @media (max-width: 768px) {
             body { padding-top: 68px; }
             nav { padding: 10px 0; }
@@ -410,8 +474,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
             .nav-links-mobile { max-width: 300px; right: 0; left: auto; border-radius: 0 0 16px 16px; }
         }
 
-        /* ===== CONVERTER UI (unchanged except for theme variables) ===== */
-        /* We keep the same converter styles but adapt to use body background and card */
         :root {
             --bg-color: #f8f9fc;
             --text-color: #1a1a2e;
@@ -434,7 +496,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
             --drop-bg: #1a1a30;
             --drop-border: #6a8cff;
         }
-        /* Override body for dark mode */
         body {
             background: var(--bg-color);
             color: var(--text-color);
@@ -617,12 +678,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
             align-items: center;
             gap: 0.5rem;
         }
-        /* override logo in converter area */
-        .logo-area {
-            display: flex;
-            align-items: center;
-            gap: 0.5rem;
-        }
         @media (max-width: 600px) {
             .card { padding: 1.5rem 1rem; }
             .drop-zone { padding: 1.5rem 0.5rem; }
@@ -632,7 +687,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
 </head>
 <body>
 
-<!-- ===== NAVBAR ===== -->
 <nav id="mainNav">
     <div class="nav-container">
         <div class="nav-left">
@@ -651,7 +705,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
     </div>
 </nav>
 
-<!-- ===== MAIN CONVERTER ===== -->
 <div class="app-container">
     <div class="card">
         <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1.5rem; flex-wrap:wrap; gap:0.5rem;">
@@ -661,7 +714,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
             </button>
         </div>
 
-        <!-- DROP ZONE -->
         <div class="drop-zone" id="dropZone">
             <i class="fas fa-cloud-upload-alt"></i>
             <p><strong>Drag &amp; drop</strong> your PDF here</p>
@@ -669,7 +721,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
             <input type="file" id="fileInput" accept=".pdf,application/pdf" />
         </div>
 
-        <!-- PROGRESS -->
         <div class="progress-wrapper" id="progressWrapper">
             <div class="progress-bar-bg">
                 <div class="progress-bar" id="progressBar" style="width:0%;"></div>
@@ -680,13 +731,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
             </div>
         </div>
 
-        <!-- PREVIEW -->
         <div class="preview-section" id="previewSection">
             <h3 style="margin-bottom:0.5rem; font-weight:500;">Preview</h3>
             <iframe id="pdfPreview" src="" title="PDF Preview"></iframe>
         </div>
 
-        <!-- ACTION BUTTONS -->
         <div class="action-group" id="actionGroup">
             <button class="btn btn-success" id="convertBtn" disabled>
                 <i class="fas fa-file-word"></i> Convert to DOCX
@@ -699,12 +748,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
             </button>
         </div>
 
-        <!-- MESSAGE -->
         <div id="message" class="message"></div>
     </div>
 </div>
 
-<!-- ===== FOOTER ===== -->
 <footer>
     <div class="footer-content">
         <div class="footer-powered">
@@ -715,21 +762,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
     </div>
 </footer>
 
-<!-- ===== JAVASCRIPT ===== -->
 <script>
     (function() {
         'use strict';
 
         document.addEventListener('DOMContentLoaded', function() {
 
-            // ===== NAVBAR SCROLL EFFECT =====
             const nav = document.getElementById('mainNav');
             window.addEventListener('scroll', function() {
                 if (window.scrollY > 50) nav.classList.add('scrolled');
                 else nav.classList.remove('scrolled');
             });
 
-            // ===== HAMBURGER TOGGLE =====
             const hamburger = document.getElementById('hamburgerBtn');
             const navLinksMobile = document.getElementById('navLinksMobile');
 
@@ -759,7 +803,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
                 }
             });
 
-            // ===== THEME TOGGLE (converter) =====
             const themeToggle = document.getElementById('themeToggle');
             const themeLabel = document.getElementById('themeLabel');
 
@@ -776,7 +819,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
                 setTheme(current === 'dark' ? 'light' : 'dark');
             });
 
-            // ===== CONVERTER LOGIC =====
             const dropZone = document.getElementById('dropZone');
             const fileInput = document.getElementById('fileInput');
             const progressWrapper = document.getElementById('progressWrapper');
@@ -879,12 +921,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
                             if (resp.success) {
                                 downloadUrl = resp.download_url;
                                 previewUrl = resp.preview_url;
-                                // Show preview
                                 pdfPreview.src = previewUrl;
                                 previewSection.style.display = 'block';
-                                // Enable convert button (acts as download)
                                 convertBtn.disabled = false;
-                                // Show download button
                                 downloadBtn.href = downloadUrl;
                                 downloadBtn.style.display = 'inline-flex';
                                 actionGroup.style.display = 'flex';
@@ -912,7 +951,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
                 xhr.send(formData);
             }
 
-            // Event listeners
             dropZone.addEventListener('click', function(e) {
                 if (e.target.tagName !== 'INPUT') {
                     fileInput.click();
@@ -954,10 +992,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
                 hideMessage();
             });
 
-            // Initial state
             resetUI();
 
-        }); // DOMContentLoaded
+        });
     })();
 </script>
 
