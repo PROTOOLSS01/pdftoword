@@ -362,7 +362,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
             color: #fff;
         }
         .action-group {
-            display: flex;
+            display: none;
             flex-wrap: wrap;
             gap: 1rem;
             margin-top: 1.5rem;
@@ -464,7 +464,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
         </div>
 
         <!-- ACTION BUTTONS -->
-        <div class="action-group" id="actionGroup" style="display: none;">
+        <div class="action-group" id="actionGroup">
             <button class="btn btn-success" id="convertBtn" disabled>
                 <i class="fas fa-file-word"></i> Convert to DOCX
             </button>
@@ -490,222 +490,228 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
     (function() {
         'use strict';
 
-        // ========== DOM REFS ==========
-        const dropZone = document.getElementById('dropZone');
-        const fileInput = document.getElementById('fileInput');
-        const progressWrapper = document.getElementById('progressWrapper');
-        const progressBar = document.getElementById('progressBar');
-        const progressPercent = document.getElementById('progressPercent');
-        const progressStatus = document.getElementById('progressStatus');
-        const previewSection = document.getElementById('previewSection');
-        const pdfPreview = document.getElementById('pdfPreview');
-        const actionGroup = document.getElementById('actionGroup');
-        const convertBtn = document.getElementById('convertBtn');
-        const downloadBtn = document.getElementById('downloadBtn');
-        const resetBtn = document.getElementById('resetBtn');
-        const messageEl = document.getElementById('message');
-        const themeToggle = document.getElementById('themeToggle');
-        const themeLabel = document.getElementById('themeLabel');
+        // Wait for DOM to be fully loaded
+        document.addEventListener('DOMContentLoaded', function() {
 
-        let currentFile = null; // File object
-        let uploadedFileName = null; // server-side name (for preview)
-        let downloadUrl = null;
+            // ========== DOM REFS ==========
+            const dropZone = document.getElementById('dropZone');
+            const fileInput = document.getElementById('fileInput');
+            const progressWrapper = document.getElementById('progressWrapper');
+            const progressBar = document.getElementById('progressBar');
+            const progressPercent = document.getElementById('progressPercent');
+            const progressStatus = document.getElementById('progressStatus');
+            const previewSection = document.getElementById('previewSection');
+            const pdfPreview = document.getElementById('pdfPreview');
+            const actionGroup = document.getElementById('actionGroup');
+            const convertBtn = document.getElementById('convertBtn');
+            const downloadBtn = document.getElementById('downloadBtn');
+            const resetBtn = document.getElementById('resetBtn');
+            const messageEl = document.getElementById('message');
+            const themeToggle = document.getElementById('themeToggle');
+            const themeLabel = document.getElementById('themeLabel');
 
-        // ========== THEME ==========
-        function setTheme(theme) {
-            document.documentElement.setAttribute('data-theme', theme);
-            localStorage.setItem('theme', theme);
-            themeLabel.textContent = theme === 'dark' ? 'Light' : 'Dark';
-            themeToggle.querySelector('i').className = theme === 'dark' ? 'fas fa-sun' : 'fas fa-moon';
-        }
-        // Load saved theme
-        const savedTheme = localStorage.getItem('theme') || 'light';
-        setTheme(savedTheme);
-        themeToggle.addEventListener('click', () => {
-            const current = document.documentElement.getAttribute('data-theme');
-            setTheme(current === 'dark' ? 'light' : 'dark');
-        });
-
-        // ========== HELPERS ==========
-        function showMessage(text, type = 'error') {
-            messageEl.textContent = text;
-            messageEl.className = 'message ' + type;
-        }
-
-        function hideMessage() {
-            messageEl.className = 'message';
-            messageEl.textContent = '';
-        }
-
-        function resetUI() {
-            hideMessage();
-            progressWrapper.style.display = 'none';
-            progressBar.style.width = '0%';
-            progressPercent.textContent = '0%';
-            previewSection.style.display = 'none';
-            pdfPreview.src = '';
-            actionGroup.style.display = 'none';
-            downloadBtn.style.display = 'none';
-            convertBtn.disabled = true;
-            currentFile = null;
-            uploadedFileName = null;
-            downloadUrl = null;
-            fileInput.value = ''; // reset file input
-        }
-
-        // ========== HANDLE FILE SELECTION ==========
-        function handleFile(file) {
-            if (!file) return;
-            // Validate type
-            if (file.type !== 'application/pdf' && !file.name.toLowerCase().endsWith('.pdf')) {
-                showMessage('Please select a valid PDF file.', 'error');
-                return;
+            // ========== THEME ==========
+            function setTheme(theme) {
+                document.documentElement.setAttribute('data-theme', theme);
+                localStorage.setItem('theme', theme);
+                themeLabel.textContent = theme === 'dark' ? 'Light' : 'Dark';
+                themeToggle.querySelector('i').className = theme === 'dark' ? 'fas fa-sun' : 'fas fa-moon';
             }
-            if (file.size > 100 * 1024 * 1024) {
-                showMessage('File exceeds 100 MB limit.', 'error');
-                return;
-            }
-            hideMessage();
-            currentFile = file;
-            // Show file name in drop zone
-            const info = dropZone.querySelector('.file-info');
-            info.textContent = `📄 ${file.name} (${(file.size / 1024 / 1024).toFixed(2)} MB)`;
-            // Trigger upload automatically
-            uploadFile(file);
-        }
-
-        // ========== UPLOAD FILE (AJAX with progress) ==========
-        function uploadFile(file) {
-            const formData = new FormData();
-            formData.append('pdf_file', file);
-
-            const xhr = new XMLHttpRequest();
-            xhr.open('POST', window.location.href, true);
-
-            // Progress events
-            xhr.upload.addEventListener('progress', (e) => {
-                if (e.lengthComputable) {
-                    const percent = Math.round((e.loaded / e.total) * 100);
-                    progressBar.style.width = percent + '%';
-                    progressPercent.textContent = percent + '%';
-                    progressStatus.textContent = percent === 100 ? 'Processing...' : 'Uploading...';
-                }
+            // Load saved theme
+            const savedTheme = localStorage.getItem('theme') || 'light';
+            setTheme(savedTheme);
+            themeToggle.addEventListener('click', () => {
+                const current = document.documentElement.getAttribute('data-theme');
+                setTheme(current === 'dark' ? 'light' : 'dark');
             });
 
-            xhr.onloadstart = function() {
-                progressWrapper.style.display = 'block';
+            // ========== HELPERS ==========
+            function showMessage(text, type) {
+                messageEl.textContent = text;
+                messageEl.className = 'message';
+                if (type) {
+                    messageEl.classList.add(type);
+                }
+                messageEl.style.display = 'block';
+            }
+
+            function hideMessage() {
+                messageEl.className = 'message';
+                messageEl.textContent = '';
+                messageEl.style.display = 'none';
+            }
+
+            function resetUI() {
+                hideMessage();
+                progressWrapper.style.display = 'none';
                 progressBar.style.width = '0%';
                 progressPercent.textContent = '0%';
                 progressStatus.textContent = 'Uploading...';
+                previewSection.style.display = 'none';
+                pdfPreview.src = '';
+                actionGroup.style.display = 'none';
+                downloadBtn.style.display = 'none';
                 convertBtn.disabled = true;
-                actionGroup.style.display = 'none'; // hide until upload complete
-                showMessage('Uploading...', '');
-            };
+                // Reset drop zone info
+                dropZone.querySelector('.file-info').textContent = 'or click to browse (max 100 MB)';
+                fileInput.value = '';
+                // Clear any stored data
+                window._uploadedFileName = null;
+                window._downloadUrl = null;
+            }
 
-            xhr.onload = function() {
-                if (xhr.status === 200) {
-                    try {
-                        const resp = JSON.parse(xhr.responseText);
-                        if (resp.success) {
-                            // Upload and conversion succeeded
-                            uploadedFileName = resp.preview_url; // e.g., uploads/pdf_xxx.pdf
-                            downloadUrl = resp.download_url;
-                            // Show preview
-                            pdfPreview.src = uploadedFileName;
-                            previewSection.style.display = 'block';
-                            // Enable convert button (though conversion already done)
-                            convertBtn.disabled = false;
-                            // Show download button
-                            downloadBtn.href = downloadUrl;
-                            downloadBtn.style.display = 'inline-flex';
-                            // Show action group
-                            actionGroup.style.display = 'flex';
-                            showMessage(resp.message, 'success');
-                            progressStatus.textContent = 'Done!';
-                        } else {
-                            showMessage(resp.message || 'Conversion failed.', 'error');
+            // ========== HANDLE FILE SELECTION ==========
+            function handleFile(file) {
+                if (!file) return;
+                // Validate type
+                if (file.type !== 'application/pdf' && !file.name.toLowerCase().endsWith('.pdf')) {
+                    showMessage('Please select a valid PDF file.', 'error');
+                    return;
+                }
+                if (file.size > 100 * 1024 * 1024) {
+                    showMessage('File exceeds 100 MB limit.', 'error');
+                    return;
+                }
+                hideMessage();
+                // Show file name in drop zone
+                const info = dropZone.querySelector('.file-info');
+                info.textContent = '📄 ' + file.name + ' (' + (file.size / 1024 / 1024).toFixed(2) + ' MB)';
+                // Trigger upload
+                uploadFile(file);
+            }
+
+            // ========== UPLOAD FILE (AJAX with progress) ==========
+            function uploadFile(file) {
+                const formData = new FormData();
+                formData.append('pdf_file', file);
+
+                const xhr = new XMLHttpRequest();
+                xhr.open('POST', window.location.href, true);
+
+                // Progress events
+                xhr.upload.addEventListener('progress', function(e) {
+                    if (e.lengthComputable) {
+                        const percent = Math.round((e.loaded / e.total) * 100);
+                        progressBar.style.width = percent + '%';
+                        progressPercent.textContent = percent + '%';
+                        progressStatus.textContent = percent === 100 ? 'Processing...' : 'Uploading...';
+                    }
+                });
+
+                xhr.onloadstart = function() {
+                    progressWrapper.style.display = 'block';
+                    progressBar.style.width = '0%';
+                    progressPercent.textContent = '0%';
+                    progressStatus.textContent = 'Uploading...';
+                    convertBtn.disabled = true;
+                    actionGroup.style.display = 'none';
+                    downloadBtn.style.display = 'none';
+                    showMessage('Uploading...', '');
+                };
+
+                xhr.onload = function() {
+                    if (xhr.status === 200) {
+                        try {
+                            const resp = JSON.parse(xhr.responseText);
+                            if (resp.success) {
+                                // Store for later use
+                                window._uploadedFileName = resp.preview_url;
+                                window._downloadUrl = resp.download_url;
+
+                                // Show preview
+                                pdfPreview.src = window._uploadedFileName;
+                                previewSection.style.display = 'block';
+
+                                // Enable convert button (now acts as download)
+                                convertBtn.disabled = false;
+
+                                // Show download button
+                                downloadBtn.href = window._downloadUrl;
+                                downloadBtn.style.display = 'inline-flex';
+
+                                // Show action group
+                                actionGroup.style.display = 'flex';
+
+                                // Show success message
+                                showMessage(resp.message, 'success');
+                                progressStatus.textContent = 'Done!';
+                            } else {
+                                showMessage(resp.message || 'Conversion failed.', 'error');
+                                resetUI();
+                            }
+                        } catch (e) {
+                            showMessage('Invalid server response.', 'error');
                             resetUI();
                         }
-                    } catch (e) {
-                        showMessage('Invalid server response.', 'error');
+                    } else {
+                        showMessage('Server error (HTTP ' + xhr.status + ').', 'error');
                         resetUI();
                     }
-                } else {
-                    showMessage('Server error (HTTP ' + xhr.status + ').', 'error');
+                };
+
+                xhr.onerror = function() {
+                    showMessage('Network error. Please try again.', 'error');
                     resetUI();
+                };
+
+                xhr.send(formData);
+            }
+
+            // ========== EVENT LISTENERS ==========
+
+            // Browse button (click on drop zone triggers file input)
+            dropZone.addEventListener('click', function(e) {
+                if (e.target.tagName !== 'INPUT') {
+                    fileInput.click();
                 }
-            };
+            });
 
-            xhr.onerror = function() {
-                showMessage('Network error. Please try again.', 'error');
+            fileInput.addEventListener('change', function(e) {
+                if (e.target.files.length > 0) {
+                    handleFile(e.target.files[0]);
+                }
+            });
+
+            // Drag & drop
+            dropZone.addEventListener('dragover', function(e) {
+                e.preventDefault();
+                dropZone.classList.add('dragover');
+            });
+            dropZone.addEventListener('dragleave', function() {
+                dropZone.classList.remove('dragover');
+            });
+            dropZone.addEventListener('drop', function(e) {
+                e.preventDefault();
+                dropZone.classList.remove('dragover');
+                if (e.dataTransfer.files.length > 0) {
+                    handleFile(e.dataTransfer.files[0]);
+                }
+            });
+
+            // Convert button -> triggers download if available
+            convertBtn.addEventListener('click', function() {
+                if (window._downloadUrl) {
+                    window.location.href = window._downloadUrl;
+                } else {
+                    showMessage('No converted file available.', 'error');
+                }
+            });
+
+            // Download button (direct link)
+            // No extra handler needed; it's an <a> with href
+
+            // Reset button
+            resetBtn.addEventListener('click', function() {
                 resetUI();
-            };
+                // Reset drop zone info
+                dropZone.querySelector('.file-info').textContent = 'or click to browse (max 100 MB)';
+                hideMessage();
+            });
 
-            xhr.send(formData);
-        }
-
-        // ========== EVENT LISTENERS ==========
-
-        // Browse button (click on drop zone triggers file input)
-        dropZone.addEventListener('click', (e) => {
-            if (e.target.tagName !== 'INPUT') {
-                fileInput.click();
-            }
-        });
-
-        fileInput.addEventListener('change', (e) => {
-            if (e.target.files.length > 0) {
-                handleFile(e.target.files[0]);
-            }
-        });
-
-        // Drag & drop
-        dropZone.addEventListener('dragover', (e) => {
-            e.preventDefault();
-            dropZone.classList.add('dragover');
-        });
-        dropZone.addEventListener('dragleave', () => {
-            dropZone.classList.remove('dragover');
-        });
-        dropZone.addEventListener('drop', (e) => {
-            e.preventDefault();
-            dropZone.classList.remove('dragover');
-            if (e.dataTransfer.files.length > 0) {
-                handleFile(e.dataTransfer.files[0]);
-            }
-        });
-
-        // Convert button (if needed, but conversion already done; we'll just trigger download)
-        convertBtn.addEventListener('click', () => {
-            if (downloadUrl) {
-                window.location.href = downloadUrl;
-            } else {
-                showMessage('No converted file available.', 'error');
-            }
-        });
-
-        // Reset button
-        resetBtn.addEventListener('click', () => {
+            // ========== INITIAL ==========
             resetUI();
-            // Reset drop zone info
-            dropZone.querySelector('.file-info').textContent = 'or click to browse (max 100 MB)';
-            // Hide message
-            hideMessage();
-            // Reset progress
-            progressWrapper.style.display = 'none';
-            progressBar.style.width = '0%';
-            progressPercent.textContent = '0%';
-            // Reset preview
-            previewSection.style.display = 'none';
-            pdfPreview.src = '';
-            actionGroup.style.display = 'none';
-            downloadBtn.style.display = 'none';
-            convertBtn.disabled = true;
-            currentFile = null;
-        });
 
-        // ========== INITIAL ==========
-        resetUI();
+        }); // end DOMContentLoaded
     })();
 </script>
 </body>
