@@ -1,8 +1,8 @@
 <?php
 /**
  * index.php
- * Production-ready PDF to Word Converter
- * Primary: LibreOffice conversion, fallback: text extraction/OCR.
+ * Production-ready PDF to Word Converter with Multiple Pages
+ * Primary: LibreOffice conversion, Fallbacks: pdftotext, Tesseract OCR
  */
 
 // ======================== CONFIGURATION ========================
@@ -79,9 +79,11 @@ function isShellExecEnabled() {
 // ======================== HANDLE ACTIONS =======================
 $action = isset($_GET['action']) ? $_GET['action'] : '';
 
+// Page routing
+$page = isset($_GET['page']) ? $_GET['page'] : 'home';
+
 if ($action === 'download' && isset($_GET['file'])) {
     $file = basename($_GET['file']);
-    // Security: only allow .docx files
     if (pathinfo($file, PATHINFO_EXTENSION) !== 'docx') {
         http_response_code(403);
         exit('Forbidden');
@@ -94,9 +96,7 @@ if ($action === 'download' && isset($_GET['file'])) {
         header('Cache-Control: private, max-age=0, must-revalidate');
         header('Pragma: public');
         readfile($filePath);
-        // Clean up the converted file after download
         @unlink($filePath);
-        // Also remove the original PDF if it exists
         $pdfFile = str_replace('.docx', '.pdf', $filePath);
         if (file_exists($pdfFile)) @unlink($pdfFile);
         exit;
@@ -111,12 +111,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
     $response = ['success' => false, 'message' => ''];
 
     try {
-        // Check if shell_exec is enabled
         if (!isShellExecEnabled()) {
             throw new Exception('System functions are disabled. Please contact administrator.');
         }
 
-        // Check if at least one conversion method is available
         $hasLibreOffice = checkLibreOffice();
         $hasPoppler = checkPoppler();
         $hasTesseract = checkTesseract();
@@ -143,7 +141,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
         if ($file['size'] > MAX_FILE_SIZE) {
             throw new Exception('File exceeds maximum size of 100 MB.');
         }
-        // Validate MIME using finfo
+        
         $finfo = finfo_open(FILEINFO_MIME_TYPE);
         $mime = finfo_file($finfo, $file['tmp_name']);
         finfo_close($finfo);
@@ -159,7 +157,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
         $inputPath = UPLOAD_DIR . $baseName . '.pdf';
         $outputPath = OUTPUT_DIR . $baseName . '.docx';
 
-        // Move uploaded file
         if (!move_uploaded_file($file['tmp_name'], $inputPath)) {
             throw new Exception('Failed to move uploaded file. Check permissions.');
         }
@@ -172,7 +169,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
         // ------------------------------------------------------------
         $converted = false;
         if ($hasLibreOffice) {
-            // LibreOffice can convert PDF to DOCX
             $cmd = sprintf(
                 'libreoffice --headless --convert-to docx --outdir %s %s 2>&1',
                 escapeshellarg(OUTPUT_DIR),
@@ -182,12 +178,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
             logError("LibreOffice return code: $returnCode", ['output' => $output]);
 
             if ($returnCode === 0) {
-                // Find the generated file
                 $possibleFiles = glob(OUTPUT_DIR . '*.docx');
                 foreach ($possibleFiles as $found) {
-                    // Check if it's the file we just created (by checking modification time)
                     if (filemtime($found) > time() - 5) {
-                        // Move to our expected filename
                         if ($found !== $outputPath) {
                             @rename($found, $outputPath);
                         }
@@ -201,7 +194,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
         }
 
         // ------------------------------------------------------------
-        // 2. Fallback: text extraction with pdftotext (for text-based PDFs)
+        // 2. Fallback: text extraction with pdftotext
         // ------------------------------------------------------------
         if (!$converted && $hasPoppler) {
             $txtFile = TEMP_DIR . $baseName . '.txt';
@@ -210,7 +203,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
             logError("pdftotext return code: $ret2");
 
             if ($ret2 === 0 && file_exists($txtFile) && filesize($txtFile) > 100) {
-                // Check for Composer autoload
                 if (!file_exists(__DIR__ . '/vendor/autoload.php')) {
                     throw new Exception('Composer autoload not found. Please run "composer require phpoffice/phpword".');
                 }
@@ -228,7 +220,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
         }
 
         // ------------------------------------------------------------
-        // 3. Fallback: OCR for scanned PDFs (using pdftoppm + tesseract)
+        // 3. Fallback: OCR for scanned PDFs
         // ------------------------------------------------------------
         if (!$converted && $hasPdftoppm && $hasTesseract) {
             $imgDir = TEMP_DIR . $baseName . '_images/';
@@ -253,7 +245,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
                             $ocrText .= $ocrOut . "\n\n";
                         }
                     }
-                    // Clean up images
                     array_map('unlink', $images);
                     @rmdir($imgDir);
 
@@ -274,7 +265,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
             }
         }
 
-        // Clean up input file
         if (file_exists($inputPath)) {
             @unlink($inputPath);
         }
@@ -284,7 +274,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
             throw new Exception('Conversion failed. Could not produce a valid DOCX file.');
         }
 
-        // Return success
         $downloadUrl = 'index.php?action=download&file=' . urlencode($baseName . '.docx');
         $response['success'] = true;
         $response['download_url'] = $downloadUrl;
@@ -340,6 +329,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
             padding: 0 28px;
         }
 
+        /* Navigation */
         nav {
             position: fixed;
             top: 0;
@@ -375,26 +365,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
             gap: 12px;
             flex: 1;
             min-width: 0;
-            justify-content: space-between;
-        }
-        .hamburger {
-            display: block !important;
-            font-size: 1.6rem;
-            color: #333;
-            cursor: pointer;
-            transition: all 0.3s ease;
-            padding: 6px 8px;
-            background: transparent;
-            border: none;
-            border-radius: 8px;
-            line-height: 1;
-            flex-shrink: 0;
-            order: 2;
-            margin-left: auto;
-        }
-        .hamburger:hover {
-            color: #cc0000;
-            background: rgba(204, 0, 0, 0.06);
         }
         .logo {
             font-size: 1.5rem;
@@ -423,12 +393,51 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
             object-fit: cover;
             flex-shrink: 0;
         }
-        .nav-center {
-            display: none !important;
-        }
+        
         .nav-links {
-            display: none !important;
+            display: flex;
+            gap: 2rem;
+            align-items: center;
+            margin-left: 2rem;
         }
+        .nav-links a {
+            text-decoration: none;
+            color: #444;
+            font-weight: 500;
+            transition: 0.3s;
+            position: relative;
+        }
+        .nav-links a:hover, .nav-links a.active {
+            color: #cc0000;
+        }
+        .nav-links a.active::after {
+            content: '';
+            position: absolute;
+            bottom: -4px;
+            left: 0;
+            right: 0;
+            height: 2px;
+            background: #cc0000;
+        }
+        
+        .hamburger {
+            display: none !important;
+            font-size: 1.6rem;
+            color: #333;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            padding: 6px 8px;
+            background: transparent;
+            border: none;
+            border-radius: 8px;
+            line-height: 1;
+            flex-shrink: 0;
+        }
+        .hamburger:hover {
+            color: #cc0000;
+            background: rgba(204, 0, 0, 0.06);
+        }
+        
         .nav-links-mobile {
             display: none;
             flex-direction: column;
@@ -478,6 +487,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
             padding-left: 8px;
         }
 
+        /* Footer */
         footer {
             margin-top: 60px;
             padding: 30px 0;
@@ -507,108 +517,65 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
             color: #ff4444;
             text-decoration: underline;
         }
-        .footer-powered i {
-            color: #ff6b6b;
-            margin: 0 6px;
+
+        /* Page Content */
+        .page-content {
+            min-height: 60vh;
+        }
+        
+        /* Hero Section */
+        .hero-section {
+            text-align: center;
+            padding: 2rem 0 1rem;
+        }
+        .hero-section h1 {
+            font-size: 2.5rem;
+            font-weight: 700;
+            color: #1a2a6c;
+            margin-bottom: 0.5rem;
+        }
+        .hero-section h1 span {
+            color: #cc0000;
+        }
+        .hero-section p {
+            font-size: 1.1rem;
+            color: #555;
+            max-width: 600px;
+            margin: 0 auto 1.5rem;
         }
 
-        @media (max-width: 768px) {
-            body { padding-top: 68px; }
-            nav { padding: 10px 0; }
-            .nav-container { padding: 0 14px; }
-            .nav-left { gap: 8px; }
-            .hamburger { font-size: 1.5rem; padding: 4px 6px; }
-            .logo { font-size: 1.2rem; gap: 6px; }
-            .logo-icon { width: 28px; height: 28px; }
-            .nav-links-mobile { padding: 12px 16px 10px; gap: 0.4rem; }
-            .nav-links-mobile a { font-size: 0.85rem; padding: 6px 0; }
-            .nav-links-mobile a i { width: 20px; font-size: 0.8rem; }
-            footer { padding: 20px 0; }
-            .footer-powered { font-size: 0.9rem; }
-        }
-        @media (max-width: 480px) {
-            body { padding-top: 62px; }
-            nav { padding: 8px 0; }
-            .nav-container { padding: 0 12px; }
-            .nav-left { gap: 6px; }
-            .hamburger { font-size: 1.3rem; padding: 3px 5px; }
-            .logo { font-size: 1rem; gap: 4px; }
-            .logo-icon { width: 24px; height: 24px; }
-            .nav-links-mobile { padding: 12px 16px 10px; gap: 0.4rem; }
-            .nav-links-mobile a { font-size: 0.85rem; padding: 6px 0; }
-            .nav-links-mobile a i { width: 20px; font-size: 0.8rem; }
-            .footer-powered { font-size: 0.8rem; }
-        }
-        @media (max-width: 360px) {
-            .logo { font-size: 0.85rem; gap: 3px; }
-            .logo-icon { width: 20px; height: 20px; }
-            .hamburger { font-size: 1.1rem; padding: 2px 4px; }
-            .nav-container { padding: 0 8px; }
-        }
-        @media (min-width: 769px) {
-            .nav-left { flex: 1; justify-content: space-between; }
-            .hamburger { display: block !important; font-size: 1.8rem; padding: 8px 12px; }
-            .nav-links-mobile { max-width: 300px; right: 0; left: auto; border-radius: 0 0 16px 16px; }
-        }
-
-        :root {
-            --bg-color: #f8f9fc;
-            --text-color: #1a1a2e;
-            --card-bg: #ffffff;
-            --border-color: #e0e5ec;
-            --primary: #4a6cf7;
-            --primary-hover: #3a56d4;
-            --shadow: 0 10px 30px rgba(0, 0, 0, 0.08);
-            --radius: 16px;
-            --transition: 0.3s ease;
-            --drop-bg: #f0f4ff;
-            --drop-border: #4a6cf7;
-        }
-        [data-theme="dark"] {
-            --bg-color: #0f0f1a;
-            --text-color: #e4e6f0;
-            --card-bg: #1a1a2e;
-            --border-color: #2d2d44;
-            --shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
-            --drop-bg: #1a1a30;
-            --drop-border: #6a8cff;
-        }
-        body {
-            background: var(--bg-color);
-            color: var(--text-color);
-            transition: background var(--transition), color var(--transition);
-        }
+        /* Card */
         .app-container {
             max-width: 800px;
             margin: 0 auto;
             padding: 0 20px;
         }
         .card {
-            background: var(--card-bg);
-            border-radius: var(--radius);
-            box-shadow: var(--shadow);
+            background: var(--card-bg, #ffffff);
+            border-radius: 16px;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.08);
             padding: 2rem 1.5rem;
-            border: 1px solid var(--border-color);
-            transition: background var(--transition), border var(--transition), box-shadow var(--transition);
+            border: 1px solid var(--border-color, #e0e5ec);
+            transition: background 0.3s ease, border 0.3s ease, box-shadow 0.3s ease;
             margin-bottom: 1.5rem;
         }
         .drop-zone {
-            border: 2px dashed var(--border-color);
-            border-radius: var(--radius);
+            border: 2px dashed var(--border-color, #e0e5ec);
+            border-radius: 16px;
             padding: 2.5rem 1rem;
             text-align: center;
             cursor: pointer;
-            transition: border var(--transition), background var(--transition);
-            background: var(--drop-bg);
+            transition: border 0.3s ease, background 0.3s ease;
+            background: var(--drop-bg, #f0f4ff);
             position: relative;
         }
         .drop-zone.dragover {
-            border-color: var(--drop-border);
+            border-color: var(--drop-border, #4a6cf7);
             background: rgba(74, 108, 247, 0.06);
         }
         .drop-zone i {
             font-size: 3rem;
-            color: var(--primary);
+            color: #4a6cf7;
             margin-bottom: 0.5rem;
         }
         .drop-zone p {
@@ -627,6 +594,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
             width: 100%;
             height: 100%;
         }
+        
         .progress-wrapper {
             display: none;
             margin-top: 1.5rem;
@@ -634,7 +602,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
         .progress-bar-bg {
             width: 100%;
             height: 8px;
-            background: var(--border-color);
+            background: var(--border-color, #e0e5ec);
             border-radius: 10px;
             overflow: hidden;
         }
@@ -652,6 +620,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
             margin-top: 0.3rem;
             opacity: 0.8;
         }
+        
         .preview-section {
             display: none;
             margin-top: 1.5rem;
@@ -659,10 +628,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
         .preview-section iframe {
             width: 100%;
             height: 400px;
-            border: 1px solid var(--border-color);
-            border-radius: var(--radius);
+            border: 1px solid var(--border-color, #e0e5ec);
+            border-radius: 16px;
             background: #fff;
         }
+        
         .btn {
             display: inline-flex;
             align-items: center;
@@ -674,13 +644,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
             font-weight: 600;
             font-size: 1rem;
             cursor: pointer;
-            transition: all var(--transition);
+            transition: all 0.3s ease;
             text-decoration: none;
-            background: var(--primary);
+            background: #4a6cf7;
             color: #fff;
         }
         .btn:hover {
-            background: var(--primary-hover);
+            background: #3a56d4;
             transform: translateY(-2px);
             box-shadow: 0 8px 20px rgba(74, 108, 247, 0.3);
         }
@@ -699,13 +669,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
         }
         .btn-outline {
             background: transparent;
-            border: 2px solid var(--primary);
-            color: var(--primary);
+            border: 2px solid #4a6cf7;
+            color: #4a6cf7;
         }
         .btn-outline:hover {
-            background: var(--primary);
+            background: #4a6cf7;
             color: #fff;
         }
+        
         .action-group {
             display: none;
             flex-wrap: wrap;
@@ -713,10 +684,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
             margin-top: 1.5rem;
             justify-content: center;
         }
+        
         .message {
             margin-top: 1rem;
             padding: 0.8rem 1rem;
-            border-radius: var(--radius);
+            border-radius: 16px;
             font-weight: 500;
             display: none;
         }
@@ -730,35 +702,120 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
             color: #166534;
             display: block;
         }
+        
         .theme-toggle {
-            background: var(--card-bg);
-            border: 1px solid var(--border-color);
+            background: var(--card-bg, #ffffff);
+            border: 1px solid var(--border-color, #e0e5ec);
             border-radius: 50px;
             padding: 0.5rem 1rem;
             cursor: pointer;
             display: inline-flex;
             align-items: center;
             gap: 0.5rem;
-            color: var(--text-color);
-            transition: background var(--transition);
+            color: var(--text-color, #1a1a1a);
+            transition: background 0.3s ease;
             font-size: 0.9rem;
             margin-left: 0.5rem;
         }
         .theme-toggle:hover {
-            background: var(--drop-bg);
+            background: var(--drop-bg, #f0f4ff);
         }
-        .theme-toggle i {
+        
+        /* About/Features/Contact Pages */
+        .info-page {
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 0 20px;
+        }
+        .info-page h1 {
+            font-size: 2.2rem;
+            color: #1a2a6c;
+            margin-bottom: 1rem;
+        }
+        .info-page h1 span {
+            color: #cc0000;
+        }
+        .info-page .feature-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 1.5rem;
+            margin: 2rem 0;
+        }
+        .info-page .feature-item {
+            background: var(--card-bg, #ffffff);
+            padding: 1.5rem;
+            border-radius: 16px;
+            border: 1px solid var(--border-color, #e0e5ec);
+            text-align: center;
+            transition: transform 0.3s ease, box-shadow 0.3s ease;
+        }
+        .info-page .feature-item:hover {
+            transform: translateY(-4px);
+            box-shadow: 0 8px 25px rgba(0,0,0,0.08);
+        }
+        .info-page .feature-item i {
+            font-size: 2.5rem;
+            color: #cc0000;
+            margin-bottom: 0.5rem;
+        }
+        .info-page .feature-item h3 {
             font-size: 1.1rem;
+            margin-bottom: 0.3rem;
         }
-        .header-tools {
-            display: flex;
-            align-items: center;
-            gap: 0.5rem;
+        .info-page .feature-item p {
+            font-size: 0.9rem;
+            color: #666;
         }
-        @media (max-width: 600px) {
+        
+        /* Dark Theme */
+        :root {
+            --bg-color: #f8f9fc;
+            --text-color: #1a1a2e;
+            --card-bg: #ffffff;
+            --border-color: #e0e5ec;
+            --drop-bg: #f0f4ff;
+            --drop-border: #4a6cf7;
+        }
+        [data-theme="dark"] {
+            --bg-color: #0f0f1a;
+            --text-color: #e4e6f0;
+            --card-bg: #1a1a2e;
+            --border-color: #2d2d44;
+            --drop-bg: #1a1a30;
+            --drop-border: #6a8cff;
+        }
+        body {
+            background: var(--bg-color);
+            color: var(--text-color);
+            transition: background 0.3s ease, color 0.3s ease;
+        }
+        .info-page .feature-item {
+            background: var(--card-bg);
+            border-color: var(--border-color);
+        }
+        .info-page .feature-item p {
+            color: var(--text-color);
+            opacity: 0.7;
+        }
+
+        /* Responsive */
+        @media (max-width: 768px) {
+            body { padding-top: 68px; }
+            nav { padding: 10px 0; }
+            .nav-container { padding: 0 14px; }
+            .nav-links { display: none !important; }
+            .hamburger { display: block !important; font-size: 1.5rem; padding: 4px 6px; }
+            .logo { font-size: 1.2rem; gap: 6px; }
+            .logo-icon { width: 28px; height: 28px; }
+            .hero-section h1 { font-size: 1.8rem; }
+            .info-page h1 { font-size: 1.6rem; }
+            .feature-grid { grid-template-columns: 1fr; }
             .card { padding: 1.5rem 1rem; }
             .drop-zone { padding: 1.5rem 0.5rem; }
-            .action-group .btn { width: 100%; justify-content: center; }
+        }
+        @media (min-width: 769px) {
+            .hamburger { display: none !important; }
+            .nav-links { display: flex !important; }
         }
     </style>
 </head>
@@ -767,66 +824,177 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
 <nav id="mainNav">
     <div class="nav-container">
         <div class="nav-left">
-            <a href="index.php" class="logo">
+            <a href="?page=home" class="logo">
                 <img src="https://i.ibb.co/FkJPMZ8r/Chat-GPT-Image-Jun-18-2026-07-58-22-AM.png" alt="Pro Toolss Logo" class="logo-icon" />
                 <span class="pro">Pro</span><span class="toolss">Toolss</span>
             </a>
+            <div class="nav-links">
+                <a href="?page=home" class="<?php echo $page === 'home' ? 'active' : ''; ?>">Home</a>
+                <a href="?page=about" class="<?php echo $page === 'about' ? 'active' : ''; ?>">About</a>
+                <a href="?page=features" class="<?php echo $page === 'features' ? 'active' : ''; ?>">Features</a>
+                <a href="?page=contact" class="<?php echo $page === 'contact' ? 'active' : ''; ?>">Contact</a>
+            </div>
             <button class="hamburger" id="hamburgerBtn" aria-label="Toggle menu">
                 <i class="fas fa-bars"></i>
             </button>
         </div>
-        <div class="nav-center" style="display:none !important;"></div>
         <div class="nav-links-mobile" id="navLinksMobile">
-            <a href="index.php" class="active"><i class="fas fa-home"></i> Home</a>
+            <a href="?page=home" class="<?php echo $page === 'home' ? 'active' : ''; ?>"><i class="fas fa-home"></i> Home</a>
+            <a href="?page=about" class="<?php echo $page === 'about' ? 'active' : ''; ?>"><i class="fas fa-info-circle"></i> About</a>
+            <a href="?page=features" class="<?php echo $page === 'features' ? 'active' : ''; ?>"><i class="fas fa-star"></i> Features</a>
+            <a href="?page=contact" class="<?php echo $page === 'contact' ? 'active' : ''; ?>"><i class="fas fa-envelope"></i> Contact</a>
         </div>
     </div>
 </nav>
 
-<div class="app-container">
-    <div class="card">
-        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1.5rem; flex-wrap:wrap; gap:0.5rem;">
-            <h2 style="font-weight:600;">Upload your PDF</h2>
-            <button class="theme-toggle" id="themeToggle" aria-label="Toggle dark mode">
-                <i class="fas fa-moon"></i> <span id="themeLabel">Dark</span>
-            </button>
-        </div>
-
-        <div class="drop-zone" id="dropZone">
-            <i class="fas fa-cloud-upload-alt"></i>
-            <p><strong>Drag &amp; drop</strong> your PDF here</p>
-            <p class="file-info">or click to browse (max 100 MB)</p>
-            <input type="file" id="fileInput" accept=".pdf,application/pdf" />
-        </div>
-
-        <div class="progress-wrapper" id="progressWrapper">
-            <div class="progress-bar-bg">
-                <div class="progress-bar" id="progressBar" style="width:0%;"></div>
-            </div>
-            <div class="progress-text">
-                <span id="progressPercent">0%</span>
-                <span id="progressStatus">Uploading...</span>
-            </div>
-        </div>
-
-        <div class="preview-section" id="previewSection">
-            <h3 style="margin-bottom:0.5rem; font-weight:500;">Preview</h3>
-            <iframe id="pdfPreview" src="" title="PDF Preview"></iframe>
-        </div>
-
-        <div class="action-group" id="actionGroup">
-            <button class="btn btn-success" id="convertBtn" disabled>
-                <i class="fas fa-file-word"></i> Convert to DOCX
-            </button>
-            <a href="#" class="btn btn-success" id="downloadBtn" style="display: none;">
-                <i class="fas fa-download"></i> Download DOCX
-            </a>
-            <button class="btn btn-outline" id="resetBtn">
-                <i class="fas fa-undo"></i> New File
-            </button>
-        </div>
-
-        <div id="message" class="message"></div>
+<div class="page-content">
+    <?php if ($page === 'home'): ?>
+    <!-- HOME PAGE -->
+    <div class="hero-section">
+        <h1>Convert <span>PDF</span> to <span>Word</span> Instantly</h1>
+        <p>Upload your PDF and get an editable DOCX file in seconds. Free, secure, and fast.</p>
     </div>
+    <div class="app-container">
+        <div class="card">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1.5rem; flex-wrap:wrap; gap:0.5rem;">
+                <h2 style="font-weight:600;">Upload your PDF</h2>
+                <button class="theme-toggle" id="themeToggle" aria-label="Toggle dark mode">
+                    <i class="fas fa-moon"></i> <span id="themeLabel">Dark</span>
+                </button>
+            </div>
+
+            <div class="drop-zone" id="dropZone">
+                <i class="fas fa-cloud-upload-alt"></i>
+                <p><strong>Drag &amp; drop</strong> your PDF here</p>
+                <p class="file-info">or click to browse (max 100 MB)</p>
+                <input type="file" id="fileInput" accept=".pdf,application/pdf" />
+            </div>
+
+            <div class="progress-wrapper" id="progressWrapper">
+                <div class="progress-bar-bg">
+                    <div class="progress-bar" id="progressBar" style="width:0%;"></div>
+                </div>
+                <div class="progress-text">
+                    <span id="progressPercent">0%</span>
+                    <span id="progressStatus">Uploading...</span>
+                </div>
+            </div>
+
+            <div class="preview-section" id="previewSection">
+                <h3 style="margin-bottom:0.5rem; font-weight:500;">Preview</h3>
+                <iframe id="pdfPreview" src="" title="PDF Preview"></iframe>
+            </div>
+
+            <div class="action-group" id="actionGroup">
+                <button class="btn btn-success" id="convertBtn" disabled>
+                    <i class="fas fa-file-word"></i> Convert to DOCX
+                </button>
+                <a href="#" class="btn btn-success" id="downloadBtn" style="display: none;">
+                    <i class="fas fa-download"></i> Download DOCX
+                </a>
+                <button class="btn btn-outline" id="resetBtn">
+                    <i class="fas fa-undo"></i> New File
+                </button>
+            </div>
+
+            <div id="message" class="message"></div>
+        </div>
+    </div>
+    <?php elseif ($page === 'about'): ?>
+    <!-- ABOUT PAGE -->
+    <div class="info-page">
+        <h1>About <span>ProToolss</span></h1>
+        <div class="card">
+            <p style="font-size:1.1rem; margin-bottom:1rem;">
+                <strong>ProToolss</strong> is a free online PDF to Word converter that helps you transform your PDF documents into editable Word files.
+            </p>
+            <p style="margin-bottom:1rem;">
+                Built with advanced conversion technology, our tool supports:
+            </p>
+            <ul style="list-style:none; padding:0;">
+                <li style="padding:0.5rem 0; border-bottom:1px solid var(--border-color);">
+                    <i class="fas fa-check-circle" style="color:#22c55e; margin-right:0.5rem;"></i>
+                    <strong>LibreOffice</strong> - High-quality PDF to DOCX conversion
+                </li>
+                <li style="padding:0.5rem 0; border-bottom:1px solid var(--border-color);">
+                    <i class="fas fa-check-circle" style="color:#22c55e; margin-right:0.5rem;"></i>
+                    <strong>Poppler</strong> - Text extraction for text-based PDFs
+                </li>
+                <li style="padding:0.5rem 0;">
+                    <i class="fas fa-check-circle" style="color:#22c55e; margin-right:0.5rem;"></i>
+                    <strong>Tesseract OCR</strong> - Optical Character Recognition for scanned PDFs
+                </li>
+            </ul>
+        </div>
+        <div class="card" style="margin-top:1rem;">
+            <h3 style="margin-bottom:0.5rem;">🔒 Security & Privacy</h3>
+            <p>Your files are automatically deleted after 1 hour. We never store or share your documents.</p>
+        </div>
+    </div>
+    <?php elseif ($page === 'features'): ?>
+    <!-- FEATURES PAGE -->
+    <div class="info-page">
+        <h1>Why Choose <span>ProToolss</span>?</h1>
+        <div class="feature-grid">
+            <div class="feature-item">
+                <i class="fas fa-bolt"></i>
+                <h3>Lightning Fast</h3>
+                <p>Convert PDFs to Word in seconds</p>
+            </div>
+            <div class="feature-item">
+                <i class="fas fa-shield-alt"></i>
+                <h3>100% Secure</h3>
+                <p>Files auto-delete after 1 hour</p>
+            </div>
+            <div class="feature-item">
+                <i class="fas fa-file-pdf"></i>
+                <h3>100 MB Limit</h3>
+                <p>Convert large PDF files up to 100MB</p>
+            </div>
+            <div class="feature-item">
+                <i class="fas fa-robot"></i>
+                <h3>Smart OCR</h3>
+                <p>Scanned PDFs? No problem!</p>
+            </div>
+            <div class="feature-item">
+                <i class="fas fa-globe"></i>
+                <h3>Free & Online</h3>
+                <p>No downloads, no registration</p>
+            </div>
+            <div class="feature-item">
+                <i class="fas fa-mobile-alt"></i>
+                <h3>Mobile Friendly</h3>
+                <p>Works on all devices</p>
+            </div>
+        </div>
+    </div>
+    <?php elseif ($page === 'contact'): ?>
+    <!-- CONTACT PAGE -->
+    <div class="info-page">
+        <h1>Get in <span>Touch</span></h1>
+        <div class="card">
+            <p style="font-size:1.1rem; margin-bottom:1.5rem;">
+                Have questions or suggestions? We'd love to hear from you!
+            </p>
+            <div style="display:flex; flex-direction:column; gap:1rem;">
+                <div style="display:flex; align-items:center; gap:1rem; padding:0.8rem; background:var(--drop-bg); border-radius:12px;">
+                    <i class="fas fa-envelope" style="font-size:1.5rem; color:#cc0000;"></i>
+                    <div>
+                        <strong>Email</strong><br>
+                        <a href="mailto:support@protoolss.online" style="color:#4a6cf7; text-decoration:none;">support@protoolss.online</a>
+                    </div>
+                </div>
+                <div style="display:flex; align-items:center; gap:1rem; padding:0.8rem; background:var(--drop-bg); border-radius:12px;">
+                    <i class="fas fa-globe" style="font-size:1.5rem; color:#cc0000;"></i>
+                    <div>
+                        <strong>Website</strong><br>
+                        <a href="https://www.protoolss.online" target="_blank" style="color:#4a6cf7; text-decoration:none;">www.protoolss.online</a>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    <?php endif; ?>
 </div>
 
 <footer>
@@ -845,12 +1013,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
 
         document.addEventListener('DOMContentLoaded', function() {
 
+            // Navigation scroll effect
             const nav = document.getElementById('mainNav');
             window.addEventListener('scroll', function() {
                 if (window.scrollY > 50) nav.classList.add('scrolled');
                 else nav.classList.remove('scrolled');
             });
 
+            // Mobile hamburger menu
             const hamburger = document.getElementById('hamburgerBtn');
             const navLinksMobile = document.getElementById('navLinksMobile');
 
@@ -880,6 +1050,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
                 }
             });
 
+            // Theme toggle
             const themeToggle = document.getElementById('themeToggle');
             const themeLabel = document.getElementById('themeLabel');
 
@@ -891,185 +1062,194 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
             }
             const savedTheme = localStorage.getItem('theme') || 'light';
             setTheme(savedTheme);
-            themeToggle.addEventListener('click', () => {
-                const current = document.documentElement.getAttribute('data-theme');
-                setTheme(current === 'dark' ? 'light' : 'dark');
-            });
-
-            const dropZone = document.getElementById('dropZone');
-            const fileInput = document.getElementById('fileInput');
-            const progressWrapper = document.getElementById('progressWrapper');
-            const progressBar = document.getElementById('progressBar');
-            const progressPercent = document.getElementById('progressPercent');
-            const progressStatus = document.getElementById('progressStatus');
-            const previewSection = document.getElementById('previewSection');
-            const pdfPreview = document.getElementById('pdfPreview');
-            const actionGroup = document.getElementById('actionGroup');
-            const convertBtn = document.getElementById('convertBtn');
-            const downloadBtn = document.getElementById('downloadBtn');
-            const resetBtn = document.getElementById('resetBtn');
-            const messageEl = document.getElementById('message');
-
-            let currentFile = null;
-            let downloadUrl = null;
-            let previewUrl = null;
-
-            function showMessage(text, type) {
-                messageEl.textContent = text;
-                messageEl.className = 'message';
-                if (type) {
-                    messageEl.classList.add(type);
-                }
-                messageEl.style.display = 'block';
-            }
-
-            function hideMessage() {
-                messageEl.className = 'message';
-                messageEl.textContent = '';
-                messageEl.style.display = 'none';
-            }
-
-            function resetUI() {
-                hideMessage();
-                progressWrapper.style.display = 'none';
-                progressBar.style.width = '0%';
-                progressPercent.textContent = '0%';
-                progressStatus.textContent = 'Uploading...';
-                previewSection.style.display = 'none';
-                pdfPreview.src = '';
-                actionGroup.style.display = 'none';
-                downloadBtn.style.display = 'none';
-                convertBtn.disabled = true;
-                dropZone.querySelector('.file-info').textContent = 'or click to browse (max 100 MB)';
-                fileInput.value = '';
-                currentFile = null;
-                downloadUrl = null;
-                previewUrl = null;
-            }
-
-            function handleFile(file) {
-                if (!file) return;
-                if (file.type !== 'application/pdf' && !file.name.toLowerCase().endsWith('.pdf')) {
-                    showMessage('Please select a valid PDF file.', 'error');
-                    return;
-                }
-                if (file.size > 100 * 1024 * 1024) {
-                    showMessage('File exceeds 100 MB limit.', 'error');
-                    return;
-                }
-                hideMessage();
-                const info = dropZone.querySelector('.file-info');
-                info.textContent = '📄 ' + file.name + ' (' + (file.size / 1024 / 1024).toFixed(2) + ' MB)';
-                currentFile = file;
-                uploadFile(file);
-            }
-
-            function uploadFile(file) {
-                const formData = new FormData();
-                formData.append('pdf_file', file);
-
-                const xhr = new XMLHttpRequest();
-                xhr.open('POST', window.location.href, true);
-
-                xhr.upload.addEventListener('progress', function(e) {
-                    if (e.lengthComputable) {
-                        const percent = Math.round((e.loaded / e.total) * 100);
-                        progressBar.style.width = percent + '%';
-                        progressPercent.textContent = percent + '%';
-                        progressStatus.textContent = percent === 100 ? 'Processing...' : 'Uploading...';
-                    }
+            if (themeToggle) {
+                themeToggle.addEventListener('click', () => {
+                    const current = document.documentElement.getAttribute('data-theme');
+                    setTheme(current === 'dark' ? 'light' : 'dark');
                 });
+            }
 
-                xhr.onloadstart = function() {
-                    progressWrapper.style.display = 'block';
+            // Only initialize converter on home page
+            if (document.getElementById('dropZone')) {
+                initConverter();
+            }
+
+            function initConverter() {
+                const dropZone = document.getElementById('dropZone');
+                const fileInput = document.getElementById('fileInput');
+                const progressWrapper = document.getElementById('progressWrapper');
+                const progressBar = document.getElementById('progressBar');
+                const progressPercent = document.getElementById('progressPercent');
+                const progressStatus = document.getElementById('progressStatus');
+                const previewSection = document.getElementById('previewSection');
+                const pdfPreview = document.getElementById('pdfPreview');
+                const actionGroup = document.getElementById('actionGroup');
+                const convertBtn = document.getElementById('convertBtn');
+                const downloadBtn = document.getElementById('downloadBtn');
+                const resetBtn = document.getElementById('resetBtn');
+                const messageEl = document.getElementById('message');
+
+                let currentFile = null;
+                let downloadUrl = null;
+                let previewUrl = null;
+
+                function showMessage(text, type) {
+                    messageEl.textContent = text;
+                    messageEl.className = 'message';
+                    if (type) {
+                        messageEl.classList.add(type);
+                    }
+                    messageEl.style.display = 'block';
+                }
+
+                function hideMessage() {
+                    messageEl.className = 'message';
+                    messageEl.textContent = '';
+                    messageEl.style.display = 'none';
+                }
+
+                function resetUI() {
+                    hideMessage();
+                    progressWrapper.style.display = 'none';
                     progressBar.style.width = '0%';
                     progressPercent.textContent = '0%';
                     progressStatus.textContent = 'Uploading...';
-                    convertBtn.disabled = true;
+                    previewSection.style.display = 'none';
+                    pdfPreview.src = '';
                     actionGroup.style.display = 'none';
                     downloadBtn.style.display = 'none';
-                    showMessage('Uploading...', '');
-                };
+                    convertBtn.disabled = true;
+                    dropZone.querySelector('.file-info').textContent = 'or click to browse (max 100 MB)';
+                    fileInput.value = '';
+                    currentFile = null;
+                    downloadUrl = null;
+                    previewUrl = null;
+                }
 
-                xhr.onload = function() {
-                    if (xhr.status === 200) {
-                        try {
-                            const resp = JSON.parse(xhr.responseText);
-                            if (resp.success) {
-                                downloadUrl = resp.download_url;
-                                previewUrl = resp.preview_url;
-                                pdfPreview.src = previewUrl;
-                                previewSection.style.display = 'block';
-                                convertBtn.disabled = false;
-                                downloadBtn.href = downloadUrl;
-                                downloadBtn.style.display = 'inline-flex';
-                                actionGroup.style.display = 'flex';
-                                showMessage(resp.message, 'success');
-                                progressStatus.textContent = 'Done!';
-                            } else {
-                                showMessage(resp.message || 'Conversion failed.', 'error');
+                function handleFile(file) {
+                    if (!file) return;
+                    if (file.type !== 'application/pdf' && !file.name.toLowerCase().endsWith('.pdf')) {
+                        showMessage('Please select a valid PDF file.', 'error');
+                        return;
+                    }
+                    if (file.size > 100 * 1024 * 1024) {
+                        showMessage('File exceeds 100 MB limit.', 'error');
+                        return;
+                    }
+                    hideMessage();
+                    const info = dropZone.querySelector('.file-info');
+                    info.textContent = '📄 ' + file.name + ' (' + (file.size / 1024 / 1024).toFixed(2) + ' MB)';
+                    currentFile = file;
+                    uploadFile(file);
+                }
+
+                function uploadFile(file) {
+                    const formData = new FormData();
+                    formData.append('pdf_file', file);
+
+                    const xhr = new XMLHttpRequest();
+                    xhr.open('POST', window.location.href, true);
+
+                    xhr.upload.addEventListener('progress', function(e) {
+                        if (e.lengthComputable) {
+                            const percent = Math.round((e.loaded / e.total) * 100);
+                            progressBar.style.width = percent + '%';
+                            progressPercent.textContent = percent + '%';
+                            progressStatus.textContent = percent === 100 ? 'Processing...' : 'Uploading...';
+                        }
+                    });
+
+                    xhr.onloadstart = function() {
+                        progressWrapper.style.display = 'block';
+                        progressBar.style.width = '0%';
+                        progressPercent.textContent = '0%';
+                        progressStatus.textContent = 'Uploading...';
+                        convertBtn.disabled = true;
+                        actionGroup.style.display = 'none';
+                        downloadBtn.style.display = 'none';
+                        showMessage('Uploading...', '');
+                    };
+
+                    xhr.onload = function() {
+                        if (xhr.status === 200) {
+                            try {
+                                const resp = JSON.parse(xhr.responseText);
+                                if (resp.success) {
+                                    downloadUrl = resp.download_url;
+                                    previewUrl = resp.preview_url;
+                                    pdfPreview.src = previewUrl;
+                                    previewSection.style.display = 'block';
+                                    convertBtn.disabled = false;
+                                    downloadBtn.href = downloadUrl;
+                                    downloadBtn.style.display = 'inline-flex';
+                                    actionGroup.style.display = 'flex';
+                                    showMessage(resp.message, 'success');
+                                    progressStatus.textContent = 'Done!';
+                                } else {
+                                    showMessage(resp.message || 'Conversion failed.', 'error');
+                                    resetUI();
+                                }
+                            } catch (e) {
+                                showMessage('Invalid server response.', 'error');
                                 resetUI();
                             }
-                        } catch (e) {
-                            showMessage('Invalid server response.', 'error');
+                        } else {
+                            showMessage('Server error (HTTP ' + xhr.status + ').', 'error');
                             resetUI();
                         }
-                    } else {
-                        showMessage('Server error (HTTP ' + xhr.status + ').', 'error');
+                    };
+
+                    xhr.onerror = function() {
+                        showMessage('Network error. Please try again.', 'error');
                         resetUI();
+                    };
+
+                    xhr.send(formData);
+                }
+
+                dropZone.addEventListener('click', function(e) {
+                    if (e.target.tagName !== 'INPUT') {
+                        fileInput.click();
                     }
-                };
+                });
 
-                xhr.onerror = function() {
-                    showMessage('Network error. Please try again.', 'error');
+                fileInput.addEventListener('change', function(e) {
+                    if (e.target.files.length > 0) {
+                        handleFile(e.target.files[0]);
+                    }
+                });
+
+                dropZone.addEventListener('dragover', function(e) {
+                    e.preventDefault();
+                    dropZone.classList.add('dragover');
+                });
+                dropZone.addEventListener('dragleave', function() {
+                    dropZone.classList.remove('dragover');
+                });
+                dropZone.addEventListener('drop', function(e) {
+                    e.preventDefault();
+                    dropZone.classList.remove('dragover');
+                    if (e.dataTransfer.files.length > 0) {
+                        handleFile(e.dataTransfer.files[0]);
+                    }
+                });
+
+                convertBtn.addEventListener('click', function() {
+                    if (downloadUrl) {
+                        window.location.href = downloadUrl;
+                    } else {
+                        showMessage('No converted file available.', 'error');
+                    }
+                });
+
+                resetBtn.addEventListener('click', function() {
                     resetUI();
-                };
+                    dropZone.querySelector('.file-info').textContent = 'or click to browse (max 100 MB)';
+                    hideMessage();
+                });
 
-                xhr.send(formData);
-            }
-
-            dropZone.addEventListener('click', function(e) {
-                if (e.target.tagName !== 'INPUT') {
-                    fileInput.click();
-                }
-            });
-
-            fileInput.addEventListener('change', function(e) {
-                if (e.target.files.length > 0) {
-                    handleFile(e.target.files[0]);
-                }
-            });
-
-            dropZone.addEventListener('dragover', function(e) {
-                e.preventDefault();
-                dropZone.classList.add('dragover');
-            });
-            dropZone.addEventListener('dragleave', function() {
-                dropZone.classList.remove('dragover');
-            });
-            dropZone.addEventListener('drop', function(e) {
-                e.preventDefault();
-                dropZone.classList.remove('dragover');
-                if (e.dataTransfer.files.length > 0) {
-                    handleFile(e.dataTransfer.files[0]);
-                }
-            });
-
-            convertBtn.addEventListener('click', function() {
-                if (downloadUrl) {
-                    window.location.href = downloadUrl;
-                } else {
-                    showMessage('No converted file available.', 'error');
-                }
-            });
-
-            resetBtn.addEventListener('click', function() {
                 resetUI();
-                dropZone.querySelector('.file-info').textContent = 'or click to browse (max 100 MB)';
-                hideMessage();
-            });
-
-            resetUI();
+            }
 
         });
     })();
