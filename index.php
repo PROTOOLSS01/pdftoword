@@ -11,7 +11,7 @@ define('UPLOAD_DIR', __DIR__ . '/uploads/');
 define('OUTPUT_DIR', __DIR__ . '/output/');
 define('TEMP_DIR', __DIR__ . '/temp/');
 define('CLEANUP_AGE', 3600); // delete files older than 1 hour
-define('DEBUG', true); // set to false in production
+define('DEBUG', false); // set to true for debugging
 
 // Create directories if they don't exist
 foreach ([UPLOAD_DIR, OUTPUT_DIR, TEMP_DIR] as $dir) {
@@ -43,7 +43,6 @@ function logError($msg, $context = []) {
     }
     error_log($log);
     if (defined('DEBUG') && DEBUG) {
-        // In debug mode, we can also store in a file
         file_put_contents(TEMP_DIR . 'debug.log', $log . PHP_EOL, FILE_APPEND);
     }
 }
@@ -51,34 +50,30 @@ function logError($msg, $context = []) {
 // ======================== CHECK TOOLS ==========================
 function checkLibreOffice() {
     $which = shell_exec('which libreoffice 2>/dev/null');
-    if (empty($which)) {
-        return false;
-    }
-    return true;
+    return !empty(trim($which));
 }
 
 function checkPoppler() {
     $which = shell_exec('which pdftotext 2>/dev/null');
-    if (empty($which)) {
-        return false;
-    }
-    return true;
+    return !empty(trim($which));
 }
 
 function checkTesseract() {
     $which = shell_exec('which tesseract 2>/dev/null');
-    if (empty($which)) {
-        return false;
-    }
-    return true;
+    return !empty(trim($which));
 }
 
 function checkPdftoppm() {
     $which = shell_exec('which pdftoppm 2>/dev/null');
-    if (empty($which)) {
+    return !empty(trim($which));
+}
+
+function isShellExecEnabled() {
+    if (!function_exists('shell_exec')) {
         return false;
     }
-    return true;
+    $disabled = explode(',', ini_get('disable_functions'));
+    return !in_array('shell_exec', $disabled);
 }
 
 // ======================== HANDLE ACTIONS =======================
@@ -86,16 +81,24 @@ $action = isset($_GET['action']) ? $_GET['action'] : '';
 
 if ($action === 'download' && isset($_GET['file'])) {
     $file = basename($_GET['file']);
+    // Security: only allow .docx files
+    if (pathinfo($file, PATHINFO_EXTENSION) !== 'docx') {
+        http_response_code(403);
+        exit('Forbidden');
+    }
     $filePath = OUTPUT_DIR . $file;
     if (file_exists($filePath) && is_file($filePath)) {
         header('Content-Type: application/vnd.openxmlformats-officedocument.wordprocessingml.document');
         header('Content-Disposition: attachment; filename="' . $file . '"');
         header('Content-Length: ' . filesize($filePath));
+        header('Cache-Control: private, max-age=0, must-revalidate');
+        header('Pragma: public');
         readfile($filePath);
-        // Delete both the converted file and the original PDF after download
+        // Clean up the converted file after download
+        @unlink($filePath);
+        // Also remove the original PDF if it exists
         $pdfFile = str_replace('.docx', '.pdf', $filePath);
         if (file_exists($pdfFile)) @unlink($pdfFile);
-        @unlink($filePath);
         exit;
     } else {
         http_response_code(404);
@@ -108,14 +111,34 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
     $response = ['success' => false, 'message' => ''];
 
     try {
-        // Check if required tools are available
-        if (!checkLibreOffice() && !checkPoppler() && !checkTesseract()) {
-            throw new Exception('Conversion tools not installed. Please contact administrator.');
+        // Check if shell_exec is enabled
+        if (!isShellExecEnabled()) {
+            throw new Exception('System functions are disabled. Please contact administrator.');
+        }
+
+        // Check if at least one conversion method is available
+        $hasLibreOffice = checkLibreOffice();
+        $hasPoppler = checkPoppler();
+        $hasTesseract = checkTesseract();
+        $hasPdftoppm = checkPdftoppm();
+
+        if (!$hasLibreOffice && !$hasPoppler && !$hasTesseract) {
+            throw new Exception('No conversion tools available. Please install LibreOffice, Poppler, or Tesseract.');
         }
 
         $file = $_FILES['pdf_file'];
         if ($file['error'] !== UPLOAD_ERR_OK) {
-            throw new Exception('Upload error: ' . $file['error']);
+            $uploadErrors = [
+                UPLOAD_ERR_INI_SIZE => 'File exceeds upload_max_filesize directive.',
+                UPLOAD_ERR_FORM_SIZE => 'File exceeds MAX_FILE_SIZE directive.',
+                UPLOAD_ERR_PARTIAL => 'File was only partially uploaded.',
+                UPLOAD_ERR_NO_FILE => 'No file was uploaded.',
+                UPLOAD_ERR_NO_TMP_DIR => 'Missing temporary folder.',
+                UPLOAD_ERR_CANT_WRITE => 'Failed to write file to disk.',
+                UPLOAD_ERR_EXTENSION => 'File upload stopped by extension.'
+            ];
+            $errorMsg = isset($uploadErrors[$file['error']]) ? $uploadErrors[$file['error']] : 'Unknown upload error.';
+            throw new Exception('Upload error: ' . $errorMsg);
         }
         if ($file['size'] > MAX_FILE_SIZE) {
             throw new Exception('File exceeds maximum size of 100 MB.');
@@ -145,10 +168,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
         }
 
         // ------------------------------------------------------------
-        // 1. Attempt conversion with LibreOffice
+        // 1. Attempt conversion with LibreOffice (PDF -> DOCX)
         // ------------------------------------------------------------
         $converted = false;
-        if (checkLibreOffice()) {
+        if ($hasLibreOffice) {
+            // LibreOffice can convert PDF to DOCX
             $cmd = sprintf(
                 'libreoffice --headless --convert-to docx --outdir %s %s 2>&1',
                 escapeshellarg(OUTPUT_DIR),
@@ -158,15 +182,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
             logError("LibreOffice return code: $returnCode", ['output' => $output]);
 
             if ($returnCode === 0) {
-                // LibreOffice may produce file with .docx extension, but sometimes adds suffix (e.g., .docx)
-                $possibleFiles = glob(OUTPUT_DIR . $baseName . '*.docx');
-                if (!empty($possibleFiles)) {
-                    $found = $possibleFiles[0];
-                    if ($found !== $outputPath) {
-                        rename($found, $outputPath);
-                    }
-                    if (file_exists($outputPath) && filesize($outputPath) > 0) {
-                        $converted = true;
+                // Find the generated file
+                $possibleFiles = glob(OUTPUT_DIR . '*.docx');
+                foreach ($possibleFiles as $found) {
+                    // Check if it's the file we just created (by checking modification time)
+                    if (filemtime($found) > time() - 5) {
+                        // Move to our expected filename
+                        if ($found !== $outputPath) {
+                            @rename($found, $outputPath);
+                        }
+                        if (file_exists($outputPath) && filesize($outputPath) > 0) {
+                            $converted = true;
+                        }
+                        break;
                     }
                 }
             }
@@ -175,13 +203,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
         // ------------------------------------------------------------
         // 2. Fallback: text extraction with pdftotext (for text-based PDFs)
         // ------------------------------------------------------------
-        if (!$converted && checkPoppler()) {
+        if (!$converted && $hasPoppler) {
             $txtFile = TEMP_DIR . $baseName . '.txt';
             $cmd2 = sprintf('pdftotext -layout %s %s 2>&1', escapeshellarg($inputPath), escapeshellarg($txtFile));
             exec($cmd2, $out2, $ret2);
             logError("pdftotext return code: $ret2");
 
             if ($ret2 === 0 && file_exists($txtFile) && filesize($txtFile) > 100) {
+                // Check for Composer autoload
+                if (!file_exists(__DIR__ . '/vendor/autoload.php')) {
+                    throw new Exception('Composer autoload not found. Please run "composer require phpoffice/phpword".');
+                }
                 require_once __DIR__ . '/vendor/autoload.php';
                 $phpWord = new \PhpOffice\PhpWord\PhpWord();
                 $section = $phpWord->addSection();
@@ -198,7 +230,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
         // ------------------------------------------------------------
         // 3. Fallback: OCR for scanned PDFs (using pdftoppm + tesseract)
         // ------------------------------------------------------------
-        if (!$converted && checkPdftoppm() && checkTesseract()) {
+        if (!$converted && $hasPdftoppm && $hasTesseract) {
             $imgDir = TEMP_DIR . $baseName . '_images/';
             if (!is_dir($imgDir)) mkdir($imgDir, 0755, true);
 
@@ -221,10 +253,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
                             $ocrText .= $ocrOut . "\n\n";
                         }
                     }
+                    // Clean up images
                     array_map('unlink', $images);
                     @rmdir($imgDir);
 
                     if (strlen(trim($ocrText)) > 10) {
+                        if (!file_exists(__DIR__ . '/vendor/autoload.php')) {
+                            throw new Exception('Composer autoload not found. Please run "composer require phpoffice/phpword".');
+                        }
                         require_once __DIR__ . '/vendor/autoload.php';
                         $phpWord = new \PhpOffice\PhpWord\PhpWord();
                         $section = $phpWord->addSection();
@@ -238,8 +274,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
             }
         }
 
+        // Clean up input file
+        if (file_exists($inputPath)) {
+            @unlink($inputPath);
+        }
+
         if (!$converted || !file_exists($outputPath) || filesize($outputPath) < 100) {
-            if (file_exists($inputPath)) @unlink($inputPath);
+            if (file_exists($outputPath)) @unlink($outputPath);
             throw new Exception('Conversion failed. Could not produce a valid DOCX file.');
         }
 
