@@ -1,26 +1,71 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -e
 
-echo "Updating package list..."
-apt-get update -qq
+echo "======================================"
+echo "Starting Render Build"
+echo "======================================"
 
-echo "Installing LibreOffice..."
-apt-get install -y -qq libreoffice
+export DEBIAN_FRONTEND=noninteractive
 
-echo "Installing Poppler Utils (pdftotext)..."
-apt-get install -y -qq poppler-utils
+echo "Updating packages..."
+apt-get update
 
-echo "Creating upload, output, and temp directories..."
-mkdir -p /var/www/html/uploads /var/www/html/output /var/www/html/temp
+echo "Installing required packages..."
 
-echo "Setting permissions..."
-chown -R www-data:www-data /var/www/html
-chmod -R 755 /var/www/html/uploads /var/www/html/output /var/www/html/temp
+apt-get install -y \
+    libreoffice \
+    poppler-utils \
+    tesseract-ocr \
+    ghostscript \
+    imagemagick \
+    unzip \
+    zip \
+    curl \
+    wget \
+    fonts-dejavu \
+    libzip-dev \
+    libxml2-dev \
+    libonig-dev \
+    libpng-dev
 
-echo "Verifying LibreOffice installation..."
-libreoffice --version
+echo "Creating project folders..."
 
-echo "Verifying Poppler installation..."
-pdftotext -v 2>&1 | head -n 1
+mkdir -p uploads
+mkdir -p output
+mkdir -p temp
 
-echo "All setup completed successfully!"
+chmod -R 777 uploads
+chmod -R 777 output
+chmod -R 777 temp
+
+echo "Installing Composer packages..."
+
+composer install \
+    --no-dev \
+    --prefer-dist \
+    --optimize-autoloader \
+    --no-interaction
+
+echo "Checking installations..."
+
+echo "PHP Version:"
+php -v
+
+echo "LibreOffice:"
+libreoffice --version || soffice --version
+
+echo "Poppler:"
+pdftotext -v | head -n 1
+
+echo "Tesseract:"
+tesseract --version | head -n 1
+
+echo "Ghostscript:"
+gs --version
+
+echo "ImageMagick:"
+convert --version | head -n 1 || magick -version | head -n 1
+
+echo "======================================"
+echo "Build Completed Successfully"
+echo "======================================"
