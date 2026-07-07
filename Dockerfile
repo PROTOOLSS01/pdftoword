@@ -1,25 +1,47 @@
-FROM php:8.3-cli
+# PHP + Apache
+FROM php:8.2-apache
 
-WORKDIR /app
-
+# Install required packages
 RUN apt-get update && apt-get install -y \
     libreoffice \
     poppler-utils \
+    tesseract-ocr \
+    ghostscript \
+    imagemagick \
+    unzip \
+    zip \
+    wget \
+    curl \
+    fonts-dejavu \
     libzip-dev \
-    libpng-dev \
-    libjpeg62-turbo-dev \
-    libfreetype6-dev \
     libxml2-dev \
     libonig-dev \
-    zlib1g-dev \
-    curl \
- && docker-php-ext-configure gd --with-freetype --with-jpeg \
- && docker-php-ext-install gd zip mbstring xml \
- && apt-get clean \
- && rm -rf /var/lib/apt/lists/*
+    libpng-dev \
+    && docker-php-ext-install \
+        zip \
+        mbstring \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
 
-COPY . .
+# Enable Apache rewrite
+RUN a2enmod rewrite
 
-EXPOSE 10000
+# Set working directory
+WORKDIR /var/www/html
 
-CMD ["php", "-S", "0.0.0.0:10000", "index.php"]
+# Copy project files
+COPY . /var/www/html/
+
+# Set permissions
+RUN mkdir -p /var/www/html/uploads \
+    /var/www/html/output \
+    /var/www/html/temp \
+    && chmod -R 777 /var/www/html/uploads \
+    /var/www/html/output \
+    /var/www/html/temp
+
+# Expose Apache port
+EXPOSE 80
+
+# Start Apache
+CMD ["apache2-foreground"]
