@@ -1,0 +1,71 @@
+# .gitignore
+# Composer
+/vendor/
+composer.phar
+composer.lock
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Logs
+/logs/*.log
+/logs/*.log.*
+/logs/apache_*.log
+/logs/php_*.log
+
+# Uploads
+/uploads/*/
+/uploads/*.pdf
+/uploads/*.docx
+/uploads/*.zip
+!uploads/.gitkeep
+
+# Temp files
+/temp/*/
+/temp/*.pdf
+/temp/*.docx
+/temp/*.html
+/temp/*.png
+/temp/*.jpg
+/temp/*.jpeg
+/temp/*.txt
+!temp/.gitkeep
+
+# Cache
+/cache/
+.cache/
+*.cache
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+*.tmp
+
+# OS
+.DS_Store
+Thumbs.db
+*.tmp
+
+# PHP
+*.log
+*.cache
+*.lock
+*.sqlite
+*.db
+
+# Backup files
+*.bak
+*.backup
+*.old
+*.orig
+
+# Deployment
+deploy/
+.env.example
