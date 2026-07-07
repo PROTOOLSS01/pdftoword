@@ -1,0 +1,41 @@
+# .env.example
+APP_ENV=production
+APP_DEBUG=false
+APP_URL=https://your-app.onrender.com
+
+# Upload settings
+UPLOAD_MAX_SIZE=100M
+MAX_EXECUTION_TIME=300
+MEMORY_LIMIT=512M
+
+# Security
+CSRF_TOKEN_NAME=csrf_token
+CSRF_TOKEN_LENGTH=32
+SESSION_LIFETIME=3600
+
+# File paths
+UPLOAD_DIR=uploads
+TEMP_DIR=temp
+LOG_DIR=logs
+
+# Logging
+LOG_LEVEL=error
+LOG_FILE=app.log
+
+# Cleanup
+AUTO_DELETE_AFTER=3600
+MAX_FILE_AGE=86400
+
+# LibreOffice settings
+LIBREOFFICE_PATH=/usr/bin/libreoffice
+UNOCONV_PATH=/usr/bin/unoconv
+
+# Poppler settings
+PDFTOPPPM_PATH=/usr/bin/pdftoppm
+
+# Ghostscript settings
+GS_PATH=/usr/bin/gs
+
+# Tesseract settings
+TESSERACT_PATH=/usr/bin/tesseract
+TESSERACT_LANG=eng+fra+deu+spa+ita+por+rus+jpn+chi-sim+chi-tra+ara+hin+kor+tha+vie+nld+swe+pol+tur+heb+ces+slv+hrv+ron+bul+ell+hun+fin+nor+dan+lit+lav+est+mkd=srp+slk
