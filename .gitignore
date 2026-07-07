@@ -1,0 +1,64 @@
+# Composer
+vendor/
+composer.phar
+composer.lock
+
+# Upload and output directories
+uploads/
+outputs/
+
+# Logs
+*.log
+error_log
+access_log
+
+# OS files
+.DS_Store
+Thumbs.db
+.desktop
+*.swp
+*.swo
+*~
+
+# IDE files
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+
+# Environment
+.env
+.env.*
+.env.local
+.env.*.local
+
+# Temporary files
+*.tmp
+*.temp
+*.cache
+
+# Docker
+docker-compose.override.yml
+
+# Testing
+phpunit.xml
+*.test
+*.spec
+tests/
+test/
+
+# Documentation
+*.md
+!README.md
+docs/
+
+# Build files
+build/
+dist/
+*.phar
+*.zip
+*.tar.gz
+
+# Project specific
+.htaccess
+.htpasswd
