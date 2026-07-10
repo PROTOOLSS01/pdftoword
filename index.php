@@ -1,10 +1,55 @@
 <?php
-require_once 'vendor/autoload.php';
+/**
+ * PDF to Word Converter - Production Ready
+ * PHP 8.2+ Compatible
+ * 
+ * Conversion Strategies (in order):
+ * 1. LibreOffice (best for formatted PDFs)
+ * 2. PDF Parser (for text-based PDFs)
+ * 3. OCR with Tesseract (for scanned PDFs)
+ */
 
-use PhpOffice\PhpWord\IOFactory;
-use PhpOffice\PhpWord\Settings;
-use Smalot\PdfParser\Parser;
-use thiagoalessio\TesseractOCR\TesseractOCR;
+// ============================================================
+// BOOTSTRAP & ERROR HANDLING
+// ============================================================
+
+// Enable error reporting for development (disable in production)
+error_reporting(E_ALL);
+ini_set('display_errors', 0);
+ini_set('log_errors', 1);
+ini_set('error_log', __DIR__ . '/error.log');
+
+// Set maximum execution time for large files
+set_time_limit(300); // 5 minutes
+ini_set('memory_limit', '512M');
+
+// ============================================================
+// DEPENDENCY CHECK
+// ============================================================
+
+$autoloadPath = __DIR__ . '/vendor/autoload.php';
+if (!file_exists($autoloadPath)) {
+    die('<h2>Configuration Error</h2><p>Composer dependencies not found. Please run: <code>composer install</code></p>');
+}
+require_once $autoloadPath;
+
+// Verify required classes exist
+$requiredClasses = [
+    'PhpOffice\PhpWord\IOFactory',
+    'PhpOffice\PhpWord\Settings',
+    'Smalot\PdfParser\Parser'
+];
+
+foreach ($requiredClasses as $class) {
+    if (!class_exists($class)) {
+        die('<h2>Dependency Error</h2><p>Required class not found: ' . htmlspecialchars($class) . 
+            '. Please run: <code>composer update</code></p>');
+    }
+}
+
+// ============================================================
+// SESSION & CONFIGURATION
+// ============================================================
 
 session_start();
 
@@ -12,52 +57,396 @@ session_start();
 $maxFileSize = 100 * 1024 * 1024; // 100MB
 $uploadDir = __DIR__ . '/uploads/';
 $outputDir = __DIR__ . '/outputs/';
+$tempDir = __DIR__ . '/temp/';
+$logFile = __DIR__ . '/conversion.log';
 
-// Create directories if they don't exist
-if (!file_exists($uploadDir)) {
-    mkdir($uploadDir, 0755, true);
-}
-if (!file_exists($outputDir)) {
-    mkdir($outputDir, 0755, true);
+// ============================================================
+// DIRECTORY SETUP & PERMISSION CHECK
+// ============================================================
+
+function ensureDirectory($dir) {
+    if (!file_exists($dir)) {
+        if (!mkdir($dir, 0755, true)) {
+            throw new RuntimeException("Failed to create directory: $dir");
+        }
+    }
+    if (!is_writable($dir)) {
+        throw new RuntimeException("Directory is not writable: $dir");
+    }
+    return true;
 }
 
-// Clean old temporary files (older than 1 hour)
-$files = glob($uploadDir . '*');
-$now = time();
-foreach ($files as $file) {
-    if (is_file($file) && ($now - filemtime($file) > 3600)) {
-        unlink($file);
+try {
+    ensureDirectory($uploadDir);
+    ensureDirectory($outputDir);
+    ensureDirectory($tempDir);
+} catch (RuntimeException $e) {
+    die('<h2>Permission Error</h2><p>' . htmlspecialchars($e->getMessage()) . '</p>');
+}
+
+// ============================================================
+// LOGGING FUNCTION
+// ============================================================
+
+function logMessage($message, $level = 'INFO') {
+    global $logFile;
+    $timestamp = date('Y-m-d H:i:s');
+    $logEntry = "[$timestamp] [$level] $message" . PHP_EOL;
+    @file_put_contents($logFile, $logEntry, FILE_APPEND);
+}
+
+// ============================================================
+// CLEANUP OLD FILES
+// ============================================================
+
+function cleanupOldFiles($dir, $maxAge = 3600) {
+    if (!file_exists($dir)) return;
+    $files = glob($dir . '*');
+    $now = time();
+    foreach ($files as $file) {
+        if (is_file($file) && ($now - filemtime($file) > $maxAge)) {
+            @unlink($file);
+        }
     }
 }
-$files = glob($outputDir . '*');
-foreach ($files as $file) {
-    if (is_file($file) && ($now - filemtime($file) > 3600)) {
-        unlink($file);
+
+cleanupOldFiles($uploadDir);
+cleanupOldFiles($outputDir);
+cleanupOldFiles($tempDir);
+
+// ============================================================
+// TOOL PATH DETECTION
+// ============================================================
+
+function findExecutable($commands) {
+    if (!function_exists('exec')) {
+        return false;
+    }
+    
+    foreach ((array)$commands as $cmd) {
+        // Check if it's a full path or just a command
+        if (file_exists($cmd) && is_executable($cmd)) {
+            return $cmd;
+        }
+        
+        // Try which command to find path
+        $output = [];
+        $returnCode = 0;
+        exec("which $cmd 2>/dev/null", $output, $returnCode);
+        if ($returnCode === 0 && !empty($output[0]) && file_exists($output[0]) && is_executable($output[0])) {
+            return $output[0];
+        }
+    }
+    return false;
+}
+
+// Detect tools
+$libreofficePath = findExecutable(['libreoffice', 'soffice', '/usr/bin/libreoffice', '/usr/bin/soffice']);
+$ghostscriptPath = findExecutable(['gs', '/usr/bin/gs', '/usr/local/bin/gs']);
+$tesseractPath = findExecutable(['tesseract', '/usr/bin/tesseract', '/usr/local/bin/tesseract']);
+
+// Log tool availability
+logMessage("Tool detection: LibreOffice=" . ($libreofficePath ?: 'not found') . 
+           ", Ghostscript=" . ($ghostscriptPath ?: 'not found') . 
+           ", Tesseract=" . ($tesseractPath ?: 'not found'));
+
+// ============================================================
+// PDF CONVERSION FUNCTIONS
+// ============================================================
+
+/**
+ * Strategy 1: Convert using LibreOffice
+ */
+function convertWithLibreOffice($pdfPath, $wordPath, $libreofficePath) {
+    if (!$libreofficePath) {
+        return ['success' => false, 'error' => 'LibreOffice not available'];
+    }
+    
+    if (!function_exists('exec')) {
+        return ['success' => false, 'error' => 'exec() function is disabled'];
+    }
+    
+    try {
+        $outputDir = dirname($wordPath);
+        $baseName = pathinfo($pdfPath, PATHINFO_FILENAME);
+        $expectedOutput = $outputDir . '/' . $baseName . '.docx';
+        
+        // Ensure output directory exists
+        if (!file_exists($outputDir)) {
+            mkdir($outputDir, 0755, true);
+        }
+        
+        // Build command with proper escaping
+        $command = escapeshellcmd($libreofficePath) . 
+                   ' --headless --convert-to docx --outdir ' . escapeshellarg($outputDir) . 
+                   ' ' . escapeshellarg($pdfPath) . ' 2>&1';
+        
+        logMessage("Running LibreOffice command: $command");
+        
+        $output = [];
+        $returnCode = 0;
+        exec($command, $output, $returnCode);
+        
+        if ($returnCode === 0 && file_exists($expectedOutput) && filesize($expectedOutput) > 0) {
+            // Rename to desired filename if different
+            if ($expectedOutput !== $wordPath) {
+                if (!rename($expectedOutput, $wordPath)) {
+                    return ['success' => false, 'error' => 'Failed to rename output file'];
+                }
+            }
+            return ['success' => true, 'file' => $wordPath];
+        }
+        
+        // Clean up if file exists but is empty
+        if (file_exists($expectedOutput)) {
+            @unlink($expectedOutput);
+        }
+        
+        return ['success' => false, 'error' => 'LibreOffice conversion failed with code: ' . $returnCode];
+    } catch (Exception $e) {
+        return ['success' => false, 'error' => 'LibreOffice error: ' . $e->getMessage()];
     }
 }
+
+/**
+ * Strategy 2: Extract text using PDF Parser
+ */
+function convertWithPdfParser($pdfPath, $wordPath) {
+    try {
+        if (!class_exists('Smalot\PdfParser\Parser')) {
+            return ['success' => false, 'error' => 'PDF Parser library not available'];
+        }
+        
+        $parser = new Smalot\PdfParser\Parser();
+        $pdf = $parser->parseFile($pdfPath);
+        $text = $pdf->getText();
+        
+        if (empty(trim($text))) {
+            return ['success' => false, 'error' => 'No text extracted from PDF'];
+        }
+        
+        // Create Word document
+        $phpWord = new PhpOffice\PhpWord\PhpWord();
+        $phpWord->setDefaultFontName('Arial');
+        $phpWord->setDefaultFontSize(12);
+        
+        $section = $phpWord->addSection();
+        
+        // Split into paragraphs and add
+        $paragraphs = preg_split('/\r\n|\r|\n/', $text);
+        foreach ($paragraphs as $paragraph) {
+            $paragraph = trim($paragraph);
+            if (!empty($paragraph)) {
+                $section->addText($paragraph, ['size' => 12, 'name' => 'Arial']);
+            }
+        }
+        
+        $writer = PhpOffice\PhpWord\IOFactory::createWriter($phpWord, 'Word2007');
+        $writer->save($wordPath);
+        
+        if (file_exists($wordPath) && filesize($wordPath) > 0) {
+            return ['success' => true, 'file' => $wordPath];
+        }
+        
+        return ['success' => false, 'error' => 'Failed to save Word document'];
+    } catch (Exception $e) {
+        return ['success' => false, 'error' => 'PDF Parser error: ' . $e->getMessage()];
+    }
+}
+
+/**
+ * Strategy 3: OCR using Tesseract (for scanned PDFs)
+ */
+function convertWithOCR($pdfPath, $wordPath, $ghostscriptPath, $tesseractPath) {
+    if (!$ghostscriptPath || !$tesseractPath) {
+        return ['success' => false, 'error' => 'Ghostscript or Tesseract not available'];
+    }
+    
+    if (!function_exists('exec')) {
+        return ['success' => false, 'error' => 'exec() function is disabled'];
+    }
+    
+    $tempDir = dirname($pdfPath) . '/temp_ocr/';
+    if (!file_exists($tempDir)) {
+        mkdir($tempDir, 0755, true);
+    }
+    
+    $imagePrefix = $tempDir . 'page_' . uniqid();
+    $textContent = '';
+    
+    try {
+        // Get total number of pages
+        $pageCount = 0;
+        $infoCmd = escapeshellcmd($ghostscriptPath) . 
+                   ' -dNODISPLAY -dBATCH -dNOPAUSE -sFile=' . escapeshellarg($pdfPath) . 
+                   ' -c "(r) file runpdfbegin pdfpagecount = quit" 2>&1';
+        exec($infoCmd, $infoOutput, $infoCode);
+        
+        if ($infoCode === 0 && !empty($infoOutput)) {
+            $pageCount = intval($infoOutput[0]);
+        }
+        
+        if ($pageCount <= 0) {
+            $pageCount = 1; // Default to 1 page if count failed
+        }
+        
+        logMessage("OCR: Processing $pageCount pages");
+        
+        // Convert each page to image and OCR
+        for ($page = 1; $page <= $pageCount; $page++) {
+            $imagePath = $imagePrefix . $page . '.png';
+            
+            // Convert page to PNG with improved quality
+            $gsCmd = escapeshellcmd($ghostscriptPath) . 
+                    ' -dNOPAUSE -dBATCH -sDEVICE=png16m -r300 -dFirstPage=' . $page . 
+                    ' -dLastPage=' . $page . 
+                    ' -sOutputFile=' . escapeshellarg($imagePath) . 
+                    ' ' . escapeshellarg($pdfPath) . ' 2>&1';
+            
+            exec($gsCmd, $gsOutput, $gsReturn);
+            
+            if ($gsReturn !== 0 || !file_exists($imagePath) || filesize($imagePath) === 0) {
+                logMessage("OCR: Failed to convert page $page to image", 'WARNING');
+                continue;
+            }
+            
+            // Perform OCR with optimized settings
+            $ocrCmd = escapeshellcmd($tesseractPath) . 
+                     ' ' . escapeshellarg($imagePath) . 
+                     ' stdout --psm 3 --oem 3 -l eng 2>&1';
+            
+            $ocrOutput = [];
+            $ocrReturn = 0;
+            exec($ocrCmd, $ocrOutput, $ocrReturn);
+            
+            if ($ocrReturn === 0 && !empty($ocrOutput)) {
+                $textContent .= implode("\n", $ocrOutput) . "\n\n";
+            }
+            
+            // Clean up image
+            @unlink($imagePath);
+        }
+        
+        // Clean up temp directory
+        @rmdir($tempDir);
+        
+        if (empty(trim($textContent))) {
+            return ['success' => false, 'error' => 'OCR failed to extract any text'];
+        }
+        
+        // Create Word document from OCR text
+        $phpWord = new PhpOffice\PhpWord\PhpWord();
+        $phpWord->setDefaultFontName('Arial');
+        $phpWord->setDefaultFontSize(12);
+        
+        $section = $phpWord->addSection();
+        
+        $paragraphs = preg_split('/\r\n|\r|\n/', $textContent);
+        foreach ($paragraphs as $paragraph) {
+            $paragraph = trim($paragraph);
+            if (!empty($paragraph)) {
+                $section->addText($paragraph, ['size' => 12, 'name' => 'Arial']);
+            }
+        }
+        
+        $writer = PhpOffice\PhpWord\IOFactory::createWriter($phpWord, 'Word2007');
+        $writer->save($wordPath);
+        
+        if (file_exists($wordPath) && filesize($wordPath) > 0) {
+            return ['success' => true, 'file' => $wordPath];
+        }
+        
+        return ['success' => false, 'error' => 'Failed to save OCR result'];
+    } catch (Exception $e) {
+        // Clean up temp files
+        $tempFiles = glob($tempDir . '*');
+        foreach ($tempFiles as $file) {
+            @unlink($file);
+        }
+        @rmdir($tempDir);
+        
+        return ['success' => false, 'error' => 'OCR error: ' . $e->getMessage()];
+    }
+}
+
+/**
+ * Main conversion function with fallback strategies
+ */
+function convertPdfToWord($pdfPath, $wordPath) {
+    global $libreofficePath, $ghostscriptPath, $tesseractPath;
+    
+    logMessage("Starting conversion: " . basename($pdfPath));
+    
+    // Strategy 1: LibreOffice (best for formatted PDFs)
+    $result = convertWithLibreOffice($pdfPath, $wordPath, $libreofficePath);
+    if ($result['success']) {
+        logMessage("Conversion successful using LibreOffice");
+        return $result;
+    }
+    logMessage("LibreOffice failed: " . ($result['error'] ?? 'Unknown error'));
+    
+    // Strategy 2: PDF Parser (for text-based PDFs)
+    $result = convertWithPdfParser($pdfPath, $wordPath);
+    if ($result['success']) {
+        logMessage("Conversion successful using PDF Parser");
+        return $result;
+    }
+    logMessage("PDF Parser failed: " . ($result['error'] ?? 'Unknown error'));
+    
+    // Strategy 3: OCR (for scanned PDFs)
+    $result = convertWithOCR($pdfPath, $wordPath, $ghostscriptPath, $tesseractPath);
+    if ($result['success']) {
+        logMessage("Conversion successful using OCR");
+        return $result;
+    }
+    logMessage("OCR failed: " . ($result['error'] ?? 'Unknown error'));
+    
+    // All strategies failed
+    $errors = [];
+    if (!$libreofficePath) $errors[] = 'LibreOffice not installed';
+    if (!$ghostscriptPath) $errors[] = 'Ghostscript not installed';
+    if (!$tesseractPath) $errors[] = 'Tesseract not installed';
+    if (!function_exists('exec')) $errors[] = 'exec() function is disabled';
+    
+    if (empty($errors)) {
+        $errors[] = 'All conversion methods failed';
+    }
+    
+    return ['success' => false, 'error' => implode('. ', $errors)];
+}
+
+// ============================================================
+// FILE UPLOAD HANDLING
+// ============================================================
 
 $error = '';
 $success = '';
 $downloadUrl = '';
 
-// Handle file upload
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
     $file = $_FILES['pdf_file'];
     
-    // Validate file
+    // Validate file upload
     if ($file['error'] !== UPLOAD_ERR_OK) {
         $error = 'Upload failed with error code: ' . $file['error'];
     } elseif ($file['size'] > $maxFileSize) {
         $error = 'File size exceeds 100MB limit';
+    } elseif ($file['size'] === 0) {
+        $error = 'Uploaded file is empty';
     } else {
-        $fileInfo = pathinfo($file['name']);
-        $extension = strtolower($fileInfo['extension'] ?? '');
+        // Validate MIME type
+        $finfo = finfo_open(FILEINFO_MIME_TYPE);
+        $mimeType = finfo_file($finfo, $file['tmp_name']);
+        finfo_close($finfo);
         
-        if ($extension !== 'pdf') {
-            $error = 'Only PDF files are allowed';
+        $allowedMimeTypes = ['application/pdf', 'application/x-pdf', 'application/force-download'];
+        $extension = strtolower(pathinfo($file['name'], PATHINFO_EXTENSION));
+        
+        if (!in_array($mimeType, $allowedMimeTypes) && $extension !== 'pdf') {
+            $error = 'Invalid file type. Only PDF files are allowed.';
         } else {
             // Generate secure filename
-            $originalName = $fileInfo['filename'];
+            $originalName = pathinfo($file['name'], PATHINFO_FILENAME);
             $safeName = preg_replace('/[^a-zA-Z0-9_-]/', '_', $originalName);
             $uniqueId = uniqid() . '_' . bin2hex(random_bytes(8));
             $uploadPath = $uploadDir . $uniqueId . '.pdf';
@@ -65,152 +454,37 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
             // Move uploaded file
             if (move_uploaded_file($file['tmp_name'], $uploadPath)) {
                 try {
-                    // Convert PDF to Word
+                    // Generate output filename
                     $outputFilename = $uniqueId . '.docx';
                     $outputPath = $outputDir . $outputFilename;
                     
-                    // Attempt conversion
-                    $conversionResult = convertPdfToWord($uploadPath, $outputPath);
+                    // Perform conversion
+                    $result = convertPdfToWord($uploadPath, $outputPath);
                     
-                    if ($conversionResult['success']) {
+                    if ($result['success']) {
                         $success = 'Conversion completed successfully!';
                         $downloadUrl = '/outputs/' . $outputFilename;
+                        logMessage("Conversion successful: " . basename($outputPath));
                     } else {
-                        $error = $conversionResult['error'];
+                        $error = $result['error'];
+                        logMessage("Conversion failed: " . $error, 'ERROR');
                     }
                     
                     // Clean up uploaded file
-                    if (file_exists($uploadPath)) {
-                        unlink($uploadPath);
-                    }
+                    @unlink($uploadPath);
                     
                 } catch (Exception $e) {
                     $error = 'Conversion error: ' . $e->getMessage();
-                    if (file_exists($uploadPath)) {
-                        unlink($uploadPath);
-                    }
+                    logMessage("Exception: " . $e->getMessage(), 'ERROR');
+                    @unlink($uploadPath);
                 }
             } else {
                 $error = 'Failed to move uploaded file';
+                logMessage("Failed to move uploaded file", 'ERROR');
             }
         }
     }
 }
-
-/**
- * Convert PDF to Word using multiple strategies
- */
-function convertPdfToWord($pdfPath, $wordPath) {
-    $result = ['success' => false, 'error' => ''];
-    
-    // Strategy 1: Try using LibreOffice (best for formatted PDFs)
-    if (function_exists('exec') && is_executable('/usr/bin/libreoffice')) {
-        try {
-            $command = '/usr/bin/libreoffice --headless --convert-to docx --outdir "' . dirname($wordPath) . '" "' . $pdfPath . '" 2>&1';
-            exec($command, $output, $returnCode);
-            
-            // Check if file was created
-            $possibleOutput = dirname($wordPath) . '/' . pathinfo($pdfPath, PATHINFO_FILENAME) . '.docx';
-            if ($returnCode === 0 && file_exists($possibleOutput)) {
-                // Rename to our desired filename
-                if ($possibleOutput !== $wordPath) {
-                    rename($possibleOutput, $wordPath);
-                }
-                
-                if (file_exists($wordPath) && filesize($wordPath) > 0) {
-                    $result['success'] = true;
-                    return $result;
-                }
-            }
-        } catch (Exception $e) {
-            // Continue to next strategy
-        }
-    }
-    
-    // Strategy 2: Use PDF parsing library
-    try {
-        $parser = new Parser();
-        $pdf = $parser->parseFile($pdfPath);
-        $text = $pdf->getText();
-        
-        if (!empty(trim($text))) {
-            // Create Word document from extracted text
-            $phpWord = new \PhpOffice\PhpWord\PhpWord();
-            $section = $phpWord->addSection();
-            
-            // Split text into paragraphs
-            $paragraphs = explode("\n", $text);
-            foreach ($paragraphs as $paragraph) {
-                $paragraph = trim($paragraph);
-                if (!empty($paragraph)) {
-                    $section->addText($paragraph, ['size' => 12, 'name' => 'Arial']);
-                }
-            }
-            
-            $writer = IOFactory::createWriter($phpWord, 'Word2007');
-            $writer->save($wordPath);
-            
-            if (file_exists($wordPath) && filesize($wordPath) > 0) {
-                $result['success'] = true;
-                return $result;
-            }
-        }
-    } catch (Exception $e) {
-        // Continue to OCR fallback
-    }
-    
-    // Strategy 3: OCR fallback for scanned PDFs
-    try {
-        $imagePath = dirname($pdfPath) . '/temp_image.png';
-        
-        // Convert PDF pages to images using ghostscript
-        if (is_executable('/usr/bin/gs')) {
-            $command = '/usr/bin/gs -dNOPAUSE -dBATCH -sDEVICE=png16m -r150 -sOutputFile="' . $imagePath . '" "' . $pdfPath . '" 2>&1';
-            exec($command, $output, $returnCode);
-            
-            if ($returnCode === 0 && file_exists($imagePath)) {
-                // Perform OCR using Tesseract
-                $ocr = new TesseractOCR($imagePath);
-                $text = $ocr->run();
-                
-                if (!empty(trim($text))) {
-                    // Create Word document from OCR text
-                    $phpWord = new \PhpOffice\PhpWord\PhpWord();
-                    $section = $phpWord->addSection();
-                    
-                    $paragraphs = explode("\n", $text);
-                    foreach ($paragraphs as $paragraph) {
-                        $paragraph = trim($paragraph);
-                        if (!empty($paragraph)) {
-                            $section->addText($paragraph, ['size' => 12, 'name' => 'Arial']);
-                        }
-                    }
-                    
-                    $writer = IOFactory::createWriter($phpWord, 'Word2007');
-                    $writer->save($wordPath);
-                    
-                    if (file_exists($wordPath) && filesize($wordPath) > 0) {
-                        $result['success'] = true;
-                    }
-                }
-                
-                // Clean up image
-                if (file_exists($imagePath)) {
-                    unlink($imagePath);
-                }
-            }
-        }
-    } catch (Exception $e) {
-        $result['error'] = 'All conversion methods failed: ' . $e->getMessage();
-    }
-    
-    if (!$result['success'] && empty($result['error'])) {
-        $result['error'] = 'Unable to convert PDF to Word. The PDF might be empty or corrupted.';
-    }
-    
-    return $result;
-}
-
 ?>
 <!DOCTYPE html>
 <html lang="en">
