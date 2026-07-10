@@ -7,9 +7,13 @@ RUN apt-get update && apt-get install -y \
     ghostscript \
     unzip \
     zip \
+    libzip-dev \
     git \
     curl \
-    && docker-php-ext-install zip
+    && docker-php-ext-configure zip \
+    && docker-php-ext-install zip \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY --from=composer:2 /usr/bin/composer /usr/bin/composer
 
