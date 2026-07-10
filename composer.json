@@ -1,0 +1,8 @@
+{
+  "name": "pdftoword/converter",
+  "type": "project",
+  "require": {
+    "php": "^8.2",
+    "phpoffice/phpword": "^1.0"
+  }
+}
