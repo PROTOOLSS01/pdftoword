@@ -1,5 +1,23 @@
-"require": {
-    "php": "^8.2",
-    "phpoffice/phpword": "^1.0",
-    "smalot/pdfparser": "^2.12"
+{
+    "name": "protoolss/pdf-to-word",
+    "description": "Production PDF to Word Converter",
+    "type": "project",
+    "license": "MIT",
+    "require": {
+        "php": "^8.3",
+        "phpoffice/phpword": "^1.1",
+        "smalot/pdfparser": "^2.12"
+    },
+    "config": {
+        "optimize-autoloader": true,
+        "preferred-install": "dist",
+        "sort-packages": true
+    },
+    "autoload": {
+        "psr-4": {
+            "App\\": "src/"
+        }
+    },
+    "minimum-stability": "stable",
+    "prefer-stable": true
 }
