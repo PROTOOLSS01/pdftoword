@@ -1,765 +1,885 @@
 <?php
-// index.php - Production Ready PDF to Word Converter
-// PHP 8.3, Docker, LibreOffice, Ghostscript, Tesseract OCR
+/**
+ * PDF to Word Converter
+ * 
+ * A production-ready PDF to Word document converter with OCR support
+ * Built with PHP 8.3, PHPWord, LibreOffice, Poppler, and Tesseract
+ * 
+ * @package PDF2Word
+ * @author Your Name
+ * @version 1.0.0
+ */
 
-// Security & Error Reporting
+// Error reporting for development (disable in production)
 error_reporting(E_ALL);
-ini_set('display_errors', '0');
-ini_set('log_errors', '1');
-ini_set('memory_limit', '512M');
-ini_set('upload_max_filesize', '100M');
-ini_set('post_max_size', '100M');
-ini_set('max_execution_time', '300');
+ini_set('display_errors', 0);
+ini_set('log_errors', 1);
+ini_set('error_log', '/dev/stderr');
 
-// Define paths
-define('UPLOAD_DIR', __DIR__ . '/uploads');
-define('OUTPUT_DIR', __DIR__ . '/output');
-define('LOG_FILE', __DIR__ . '/converter.log');
+// Set time limit for large files
+set_time_limit(300);
 
-// Create directories if they don't exist
-foreach ([UPLOAD_DIR, OUTPUT_DIR] as $dir) {
+// Define base paths
+define('BASE_PATH', __DIR__);
+define('UPLOAD_PATH', BASE_PATH . '/uploads');
+define('OUTPUT_PATH', BASE_PATH . '/output');
+define('TEMP_PATH', BASE_PATH . '/temp');
+
+// Create required directories
+foreach ([UPLOAD_PATH, OUTPUT_PATH, TEMP_PATH] as $dir) {
     if (!is_dir($dir)) {
         mkdir($dir, 0755, true);
     }
 }
 
-// Logging function
-function logMessage($message) {
-    file_put_contents(LOG_FILE, date('Y-m-d H:i:s') . ' - ' . $message . PHP_EOL, FILE_APPEND);
-}
-
-// Check dependencies
-function checkDependencies() {
-    $deps = [
-        'libreoffice' => 'which libreoffice',
-        'gs' => 'which gs',
-        'tesseract' => 'which tesseract',
-        'pdftoppm' => 'which pdftoppm'
-    ];
+/**
+ * Clean up temporary files
+ * 
+ * @param string $directory Directory to clean
+ * @param int $maxAge Maximum age in seconds (default: 1 hour)
+ */
+function cleanupTempFiles($directory, $maxAge = 3600) {
+    if (!is_dir($directory)) {
+        return;
+    }
     
-    $missing = [];
-    foreach ($deps as $name => $cmd) {
-        exec($cmd . ' 2>/dev/null', $output, $returnCode);
-        if ($returnCode !== 0) {
-            $missing[] = $name;
+    $files = scandir($directory);
+    $now = time();
+    
+    foreach ($files as $file) {
+        if ($file === '.' || $file === '..') {
+            continue;
+        }
+        
+        $filePath = $directory . '/' . $file;
+        if (is_file($filePath) && ($now - filemtime($filePath)) > $maxAge) {
+            @unlink($filePath);
         }
     }
+}
+
+// Clean up old temporary files
+cleanupTempFiles(UPLOAD_PATH, 3600);
+cleanupTempFiles(OUTPUT_PATH, 3600);
+cleanupTempFiles(TEMP_PATH, 3600);
+
+/**
+ * Generate a unique filename
+ * 
+ * @param string $original Original filename
+ * @return string Unique filename
+ */
+function generateUniqueFilename($original) {
+    $extension = pathinfo($original, PATHINFO_EXTENSION);
+    return uniqid() . '_' . bin2hex(random_bytes(8)) . '.' . $extension;
+}
+
+/**
+ * Check if PDF contains selectable text
+ * 
+ * @param string $pdfPath Path to PDF file
+ * @return bool True if PDF has selectable text
+ */
+function hasSelectableText($pdfPath) {
+    $tempFile = TEMP_PATH . '/text_' . uniqid() . '.txt';
+    $command = "pdftotext -q '{$pdfPath}' '{$tempFile}' 2>/dev/null";
+    exec($command, $output, $returnCode);
     
-    if (!empty($missing)) {
-        logMessage('Missing dependencies: ' . implode(', ', $missing));
-        return false;
+    $hasText = false;
+    if (file_exists($tempFile)) {
+        $content = file_get_contents($tempFile);
+        $hasText = strlen(trim($content)) > 0;
+        @unlink($tempFile);
     }
+    
+    return $hasText;
+}
+
+/**
+ * Convert PDF with selectable text to DOCX
+ * 
+ * @param string $pdfPath Path to PDF file
+ * @param string $outputPath Output path for DOCX
+ * @return bool Success status
+ */
+function convertSelectablePDF($pdfPath, $outputPath) {
+    // Use LibreOffice to convert PDF to DOCX
+    $command = "libreoffice --headless --convert-to docx --outdir '" . dirname($outputPath) . "' '{$pdfPath}' 2>&1";
+    exec($command, $output, $returnCode);
+    
+    // LibreOffice saves with original filename, so we need to rename
+    $originalBasename = pathinfo($pdfPath, PATHINFO_FILENAME);
+    $tempDocx = dirname($outputPath) . '/' . $originalBasename . '.docx';
+    
+    if (file_exists($tempDocx)) {
+        rename($tempDocx, $outputPath);
+        return true;
+    }
+    
+    return false;
+}
+
+/**
+ * Convert scanned PDF using OCR
+ * 
+ * @param string $pdfPath Path to PDF file
+ * @param string $outputPath Output path for DOCX
+ * @return bool Success status
+ * @throws Exception On OCR failure
+ */
+function convertScannedPDF($pdfPath, $outputPath) {
+    require_once 'vendor/autoload.php';
+    use PhpOffice\PhpWord\PhpWord;
+    use PhpOffice\PhpWord\IOFactory;
+    
+    $phpWord = new PhpWord();
+    $section = $phpWord->addSection();
+    
+    // Convert PDF to images
+    $imagePrefix = TEMP_PATH . '/page_' . uniqid();
+    $command = "pdftoppm -jpeg -r 300 '{$pdfPath}' '{$imagePrefix}' 2>&1";
+    exec($command, $output, $returnCode);
+    
+    if ($returnCode !== 0) {
+        throw new Exception("Failed to convert PDF to images: " . implode("\n", $output));
+    }
+    
+    // Process each page
+    $pageNumber = 1;
+    $imageFiles = glob($imagePrefix . '*.jpg');
+    
+    if (empty($imageFiles)) {
+        throw new Exception("No images generated from PDF");
+    }
+    
+    foreach ($imageFiles as $imagePath) {
+        // OCR the image
+        $textFile = TEMP_PATH . '/ocr_' . uniqid() . '.txt';
+        $command = "tesseract '{$imagePath}' '{$textFile}' -l eng --oem 3 2>&1";
+        exec($command, $output, $returnCode);
+        
+        if ($returnCode !== 0) {
+            @unlink($imagePath);
+            throw new Exception("OCR failed for page {$pageNumber}: " . implode("\n", $output));
+        }
+        
+        // Read OCR text
+        $textContent = '';
+        $textFileFull = $textFile . '.txt';
+        if (file_exists($textFileFull)) {
+            $textContent = file_get_contents($textFileFull);
+            @unlink($textFileFull);
+        }
+        
+        // Add text to Word document
+        if (!empty(trim($textContent))) {
+            $section->addTitle("Page " . $pageNumber, 1);
+            $section->addText($textContent);
+            $section->addPageBreak();
+        }
+        
+        @unlink($textFile);
+        @unlink($imagePath);
+        $pageNumber++;
+    }
+    
+    // Save DOCX
+    $objWriter = IOFactory::createWriter($phpWord, 'Word2007');
+    $objWriter->save($outputPath);
+    
     return true;
 }
 
-// Generate random filename
-function generateRandomFilename($extension) {
-    return bin2hex(random_bytes(16)) . '.' . $extension;
-}
-
-// Validate uploaded file
+/**
+ * Validate uploaded file
+ * 
+ * @param array $file $_FILES array
+ * @return array [isValid, message]
+ */
 function validateFile($file) {
     // Check for upload errors
     if ($file['error'] !== UPLOAD_ERR_OK) {
-        throw new Exception('Upload error: ' . $file['error']);
+        $errors = [
+            UPLOAD_ERR_INI_SIZE => 'File exceeds upload_max_filesize directive',
+            UPLOAD_ERR_FORM_SIZE => 'File exceeds MAX_FILE_SIZE directive',
+            UPLOAD_ERR_PARTIAL => 'File was only partially uploaded',
+            UPLOAD_ERR_NO_FILE => 'No file was uploaded',
+            UPLOAD_ERR_NO_TMP_DIR => 'Missing temporary folder',
+            UPLOAD_ERR_CANT_WRITE => 'Failed to write file to disk',
+            UPLOAD_ERR_EXTENSION => 'A PHP extension stopped the file upload'
+        ];
+        return [false, $errors[$file['error']] ?? 'Unknown upload error'];
     }
     
-    // Check file size (100MB max)
-    if ($file['size'] > 100 * 1024 * 1024) {
-        throw new Exception('File size exceeds 100MB limit');
+    // Check file size (max 50MB)
+    $maxSize = 50 * 1024 * 1024;
+    if ($file['size'] > $maxSize) {
+        return [false, 'File size exceeds 50MB limit'];
     }
     
-    // Check file type
+    // Check MIME type
     $finfo = finfo_open(FILEINFO_MIME_TYPE);
     $mimeType = finfo_file($finfo, $file['tmp_name']);
     finfo_close($finfo);
     
-    $allowedMimes = ['application/pdf', 'application/x-pdf'];
-    if (!in_array($mimeType, $allowedMimes)) {
-        throw new Exception('Invalid file type. Only PDF files are allowed.');
+    if ($mimeType !== 'application/pdf' && $mimeType !== 'application/x-pdf') {
+        return [false, 'Only PDF files are allowed'];
     }
     
-    // Additional check: file extension
-    $extension = strtolower(pathinfo($file['name'], PATHINFO_EXTENSION));
-    if ($extension !== 'pdf') {
-        throw new Exception('File must have .pdf extension');
-    }
-    
-    return true;
+    return [true, 'OK'];
 }
 
-// Detect if PDF is scanned or text-based
-function detectPdfType($pdfPath) {
-    // Use pdffonts to check for fonts
-    exec("pdffonts '$pdfPath' 2>/dev/null | tail -n +3 | grep -v '^$' | wc -l", $output, $returnCode);
-    
-    if ($returnCode === 0 && isset($output[0]) && intval($output[0]) > 0) {
-        return 'text'; // Has fonts - likely text-based
-    }
-    
-    // Check for text content using pdftotext
-    exec("pdftotext '$pdfPath' - 2>/dev/null | wc -c", $output, $returnCode);
-    if ($returnCode === 0 && isset($output[0]) && intval($output[0]) > 100) {
-        return 'text'; // Has extractable text
-    }
-    
-    return 'scanned'; // No text found - likely scanned
-}
+// Handle file upload
+$response = ['success' => false, 'message' => '', 'download' => ''];
+$uploadedFile = null;
 
-// Convert PDF to DOCX
-function convertPdfToDocx($pdfPath, $outputPath) {
-    logMessage('Starting conversion: ' . basename($pdfPath));
-    
-    // Detect PDF type
-    $pdfType = detectPdfType($pdfPath);
-    logMessage('PDF type: ' . $pdfType);
-    
-    if ($pdfType === 'text') {
-        // Use LibreOffice for text-based PDFs
-        $cmd = "libreoffice --headless --convert-to docx --outdir '" . dirname($outputPath) . "' '$pdfPath' 2>&1";
-        exec($cmd, $output, $returnCode);
-        
-        if ($returnCode !== 0) {
-            throw new Exception('LibreOffice conversion failed: ' . implode("\n", $output));
-        }
-        
-        // LibreOffice creates file with original name, rename to random
-        $originalBasename = pathinfo($pdfPath, PATHINFO_FILENAME);
-        $libreofficeOutput = dirname($outputPath) . '/' . $originalBasename . '.docx';
-        
-        if (file_exists($libreofficeOutput)) {
-            rename($libreofficeOutput, $outputPath);
-        } else {
-            throw new Exception('LibreOffice output file not found');
-        }
-    } else {
-        // Scanned PDF - OCR first then convert
-        logMessage('Performing OCR on scanned PDF');
-        $ocrPdfPath = dirname($pdfPath) . '/ocr_' . basename($pdfPath);
-        
-        // Convert PDF to images and OCR
-        $imageDir = dirname($pdfPath) . '/images';
-        if (!is_dir($imageDir)) {
-            mkdir($imageDir, 0755, true);
-        }
-        
-        // Convert PDF to images using Ghostscript
-        $cmd = "gs -dNOPAUSE -dBATCH -sDEVICE=png16m -r300 -sOutputFile='$imageDir/page_%d.png' '$pdfPath' 2>&1";
-        exec($cmd, $output, $returnCode);
-        
-        if ($returnCode !== 0) {
-            throw new Exception('Ghostscript conversion failed: ' . implode("\n", $output));
-        }
-        
-        // Process each image with Tesseract OCR
-        $images = glob($imageDir . '/*.png');
-        if (empty($images)) {
-            throw new Exception('No images generated for OCR');
-        }
-        
-        $ocrText = '';
-        foreach ($images as $image) {
-            $ocrOutput = $image . '.txt';
-            $cmd = "tesseract '$image' '" . pathinfo($image, PATHINFO_FILENAME) . "' -l eng --psm 6 2>&1";
-            exec($cmd, $output, $returnCode);
-            
-            if ($returnCode !== 0) {
-                throw new Exception('Tesseract OCR failed: ' . implode("\n", $output));
-            }
-            
-            if (file_exists($ocrOutput)) {
-                $ocrText .= file_get_contents($ocrOutput) . "\n\n";
-                unlink($ocrOutput);
-            }
-        }
-        
-        // Clean up images
-        foreach ($images as $image) {
-            unlink($image);
-        }
-        rmdir($imageDir);
-        
-        if (empty(trim($ocrText))) {
-            throw new Exception('No text extracted from scanned PDF');
-        }
-        
-        // Create a temporary text file for LibreOffice
-        $tempTextFile = dirname($pdfPath) . '/temp_text.txt';
-        file_put_contents($tempTextFile, $ocrText);
-        
-        // Convert text to DOCX using LibreOffice
-        $cmd = "libreoffice --headless --convert-to docx --outdir '" . dirname($outputPath) . "' '$tempTextFile' 2>&1";
-        exec($cmd, $output, $returnCode);
-        
-        if ($returnCode !== 0) {
-            throw new Exception('LibreOffice text to DOCX conversion failed: ' . implode("\n", $output));
-        }
-        
-        $tempDocx = dirname($outputPath) . '/temp_text.docx';
-        if (file_exists($tempDocx)) {
-            rename($tempDocx, $outputPath);
-        } else {
-            throw new Exception('DOCX output file not found');
-        }
-        
-        unlink($tempTextFile);
-    }
-    
-    logMessage('Conversion completed: ' . basename($outputPath));
-    return true;
-}
-
-// Cleanup old files (older than 1 hour)
-function cleanupFiles() {
-    $dirs = [UPLOAD_DIR, OUTPUT_DIR];
-    $now = time();
-    
-    foreach ($dirs as $dir) {
-        if (is_dir($dir)) {
-            $files = glob($dir . '/*');
-            foreach ($files as $file) {
-                if (is_file($file) && ($now - filemtime($file)) > 3600) {
-                    unlink($file);
-                    logMessage('Cleaned up old file: ' . basename($file));
-                }
-            }
-        }
-    }
-}
-
-// Handle conversion request
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
     try {
-        // Cleanup old files
-        cleanupFiles();
-        
-        // Check dependencies
-        if (!checkDependencies()) {
-            throw new Exception('Missing required system dependencies');
-        }
+        $file = $_FILES['pdf_file'];
         
         // Validate file
-        validateFile($_FILES['pdf_file']);
+        list($isValid, $message) = validateFile($file);
+        if (!$isValid) {
+            throw new Exception($message);
+        }
         
-        // Save uploaded file with random name
-        $uploadedFile = $_FILES['pdf_file'];
-        $randomName = generateRandomFilename('pdf');
-        $pdfPath = UPLOAD_DIR . '/' . $randomName;
+        // Generate unique filename and move file
+        $uniqueName = generateUniqueFilename($file['name']);
+        $uploadPath = UPLOAD_PATH . '/' . $uniqueName;
         
-        if (!move_uploaded_file($uploadedFile['tmp_name'], $pdfPath)) {
+        if (!move_uploaded_file($file['tmp_name'], $uploadPath)) {
             throw new Exception('Failed to move uploaded file');
         }
         
-        logMessage('File uploaded: ' . $randomName);
+        // Determine if PDF has selectable text
+        $hasText = hasSelectableText($uploadPath);
         
-        // Prepare output path
-        $outputName = generateRandomFilename('docx');
-        $outputPath = OUTPUT_DIR . '/' . $outputName;
+        // Generate output filename
+        $outputName = pathinfo($file['name'], PATHINFO_FILENAME) . '.docx';
+        $outputPath = OUTPUT_PATH . '/' . generateUniqueFilename($outputName);
         
-        // Convert
-        convertPdfToDocx($pdfPath, $outputPath);
-        
-        // Check if output file exists
-        if (!file_exists($outputPath) || filesize($outputPath) === 0) {
-            throw new Exception('Conversion failed: Output file is empty or missing');
+        // Convert based on text availability
+        if ($hasText) {
+            $success = convertSelectablePDF($uploadPath, $outputPath);
+            if (!$success) {
+                throw new Exception('Failed to convert PDF to Word document');
+            }
+        } else {
+            $success = convertScannedPDF($uploadPath, $outputPath);
+            if (!$success) {
+                throw new Exception('OCR conversion failed');
+            }
         }
         
-        // Prepare response
+        // Clean up uploaded file
+        @unlink($uploadPath);
+        
+        // Create download link
+        $downloadUrl = '/download.php?file=' . basename($outputPath);
+        
         $response = [
             'success' => true,
-            'message' => 'PDF successfully converted to DOCX!',
-            'download_url' => 'download.php?file=' . urlencode($outputName),
-            'filename' => $outputName
+            'message' => 'PDF converted successfully!',
+            'download' => $downloadUrl
         ];
         
-        // Clean up uploaded PDF (keep output file for download)
-        unlink($pdfPath);
-        logMessage('Uploaded PDF deleted: ' . $randomName);
-        
-        // Return JSON response for AJAX
-        if (isset($_SERVER['HTTP_X_REQUESTED_WITH']) && strtolower($_SERVER['HTTP_X_REQUESTED_WITH']) === 'xmlhttprequest') {
-            header('Content-Type: application/json');
-            echo json_encode($response);
-            exit;
-        }
-        
-        // Store result in session for non-AJAX
-        session_start();
-        $_SESSION['conversion_result'] = $response;
-        header('Location: ' . $_SERVER['PHP_SELF'] . '?result=success');
-        exit;
-        
     } catch (Exception $e) {
-        logMessage('Error: ' . $e->getMessage());
+        $response = [
+            'success' => false,
+            'message' => 'Error: ' . $e->getMessage()
+        ];
         
-        // Clean up any partial files
-        if (isset($pdfPath) && file_exists($pdfPath)) {
-            unlink($pdfPath);
+        // Clean up any leftover files
+        if (isset($uploadPath) && file_exists($uploadPath)) {
+            @unlink($uploadPath);
         }
-        
-        $error = $e->getMessage();
-        
-        if (isset($_SERVER['HTTP_X_REQUESTED_WITH']) && strtolower($_SERVER['HTTP_X_REQUESTED_WITH']) === 'xmlhttprequest') {
-            header('Content-Type: application/json');
-            http_response_code(400);
-            echo json_encode(['success' => false, 'error' => $error]);
-            exit;
-        }
-        
-        session_start();
-        $_SESSION['conversion_error'] = $error;
-        header('Location: ' . $_SERVER['PHP_SELF'] . '?error=1');
-        exit;
     }
 }
 
-// Handle download
+// Download handler
 if (isset($_GET['download']) && isset($_GET['file'])) {
-    $filename = basename($_GET['file']);
-    $filepath = OUTPUT_DIR . '/' . $filename;
+    $file = basename($_GET['file']);
+    $filePath = OUTPUT_PATH . '/' . $file;
     
-    if (file_exists($filepath)) {
-        // Clean up after download
-        $cleanup = function() use ($filepath) {
-            if (file_exists($filepath)) {
-                unlink($filepath);
-                logMessage('Output file deleted after download: ' . basename($filepath));
-            }
-        };
-        register_shutdown_function($cleanup);
-        
+    if (file_exists($filePath)) {
         header('Content-Type: application/vnd.openxmlformats-officedocument.wordprocessingml.document');
-        header('Content-Disposition: attachment; filename="converted_' . date('Y-m-d') . '.docx"');
-        header('Content-Length: ' . filesize($filepath));
-        header('Cache-Control: private, max-age=0, must-revalidate');
-        header('Pragma: public');
+        header('Content-Disposition: attachment; filename="' . $file . '"');
+        header('Content-Length: ' . filesize($filePath));
+        readfile($filePath);
         
-        readfile($filepath);
-        exit;
-    } else {
-        http_response_code(404);
-        echo 'File not found or already deleted.';
+        // Clean up after download
+        @unlink($filePath);
         exit;
     }
+    
+    http_response_code(404);
+    die('File not found');
 }
 
-// Show result page
-session_start();
-$result = $_SESSION['conversion_result'] ?? null;
-$error = $_SESSION['conversion_error'] ?? null;
-unset($_SESSION['conversion_result'], $_SESSION['conversion_error']);
+// Display the main interface
 ?>
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Free PDF to Word Converter | Convert PDF to DOCX Online</title>
-    <meta name="description" content="Convert PDF to editable DOCX online for free. Supports both text and scanned PDFs. No signup required.">
-    <link rel="canonical" href="https://<?php echo $_SERVER['HTTP_HOST']; ?>">
+    <meta name="description" content="Free PDF to Word Converter - Convert PDFs to editable Word documents with OCR support">
+    <meta name="keywords" content="PDF to Word, Convert PDF, OCR, PDF Converter">
+    <meta name="robots" content="index, follow">
+    <title>PDF to Word Converter - Free Online Tool</title>
+    
+    <!-- Favicon -->
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📄</text></svg>">
+    
     <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
+        /* CSS Variables for themes */
+        :root {
+            --bg-primary: #ffffff;
+            --bg-secondary: #f8f9fa;
+            --bg-card: #ffffff;
+            --text-primary: #212529;
+            --text-secondary: #6c757d;
+            --border-color: #dee2e6;
+            --accent-color: #0d6efd;
+            --accent-hover: #0b5ed7;
+            --success-color: #198754;
+            --danger-color: #dc3545;
+            --shadow: 0 0.5rem 1rem rgba(0, 0, 0, 0.15);
+            --radius: 1rem;
+            --transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+        
+        [data-theme="dark"] {
+            --bg-primary: #1a1a1a;
+            --bg-secondary: #2d2d2d;
+            --bg-card: #2d2d2d;
+            --text-primary: #e9ecef;
+            --text-secondary: #adb5bd;
+            --border-color: #404040;
+            --shadow: 0 0.5rem 1rem rgba(0, 0, 0, 0.5);
+        }
+        
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
         body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            transition: var(--transition);
             min-height: 100vh;
             display: flex;
-            justify-content: center;
             align-items: center;
-            padding: 20px;
+            justify-content: center;
+            padding: 1rem;
         }
+        
         .container {
-            background: white;
-            border-radius: 20px;
-            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
-            padding: 40px;
-            max-width: 600px;
+            max-width: 768px;
             width: 100%;
-            transition: all 0.3s ease;
+            background: var(--bg-card);
+            border-radius: var(--radius);
+            box-shadow: var(--shadow);
+            padding: 2rem;
+            transition: var(--transition);
         }
-        h1 {
-            color: #2d3748;
-            font-size: 28px;
-            margin-bottom: 8px;
+        
+        /* Header */
+        .header {
             text-align: center;
+            margin-bottom: 2rem;
         }
-        .subtitle {
-            color: #718096;
-            text-align: center;
-            margin-bottom: 30px;
-            font-size: 16px;
+        
+        .header h1 {
+            font-size: 2.25rem;
+            font-weight: 700;
+            margin-bottom: 0.5rem;
+            background: linear-gradient(135deg, var(--accent-color), #6f42c1);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
         }
-        .upload-area {
-            border: 3px dashed #e2e8f0;
-            border-radius: 16px;
-            padding: 40px 20px;
+        
+        .header p {
+            color: var(--text-secondary);
+            font-size: 1rem;
+        }
+        
+        /* Theme toggle */
+        .theme-toggle {
+            position: fixed;
+            top: 1rem;
+            right: 1rem;
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 50%;
+            width: 3rem;
+            height: 3rem;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            font-size: 1.5rem;
+            transition: var(--transition);
+            box-shadow: var(--shadow);
+            z-index: 1000;
+        }
+        
+        .theme-toggle:hover {
+            transform: scale(1.1);
+        }
+        
+        /* Drop zone */
+        .drop-zone {
+            border: 2px dashed var(--border-color);
+            border-radius: var(--radius);
+            padding: 3rem 1rem;
             text-align: center;
             cursor: pointer;
-            transition: all 0.3s ease;
+            transition: var(--transition);
+            background: var(--bg-secondary);
             position: relative;
-            background: #f7fafc;
         }
-        .upload-area:hover, .upload-area.dragover {
-            border-color: #667eea;
-            background: #edf2f7;
-            transform: scale(1.01);
+        
+        .drop-zone:hover,
+        .drop-zone.drag-over {
+            border-color: var(--accent-color);
+            background: var(--bg-primary);
         }
-        .upload-area svg {
-            width: 64px;
-            height: 64px;
-            color: #667eea;
-            margin-bottom: 16px;
+        
+        .drop-zone .icon {
+            font-size: 4rem;
+            margin-bottom: 1rem;
         }
-        .upload-area p {
-            color: #4a5568;
-            font-size: 18px;
-            margin-bottom: 8px;
+        
+        .drop-zone h3 {
+            font-size: 1.25rem;
+            margin-bottom: 0.5rem;
         }
-        .upload-area small {
-            color: #a0aec0;
-            font-size: 14px;
+        
+        .drop-zone p {
+            color: var(--text-secondary);
+            font-size: 0.875rem;
         }
-        #fileInput {
+        
+        .drop-zone input[type="file"] {
+            position: absolute;
+            inset: 0;
+            opacity: 0;
+            cursor: pointer;
+        }
+        
+        /* File info */
+        .file-info {
             display: none;
+            margin-top: 1rem;
+            padding: 1rem;
+            background: var(--bg-secondary);
+            border-radius: 0.5rem;
+            align-items: center;
+            gap: 1rem;
         }
+        
+        .file-info.show {
+            display: flex;
+        }
+        
+        .file-info .name {
+            flex: 1;
+            font-size: 0.875rem;
+            word-break: break-all;
+        }
+        
+        .file-info .size {
+            color: var(--text-secondary);
+            font-size: 0.75rem;
+            white-space: nowrap;
+        }
+        
+        /* Progress bar */
         .progress-container {
-            margin-top: 20px;
             display: none;
-        }
-        .progress-bar {
-            width: 100%;
-            height: 8px;
-            background: #e2e8f0;
-            border-radius: 4px;
+            margin-top: 1rem;
+            height: 0.5rem;
+            background: var(--bg-secondary);
+            border-radius: 999px;
             overflow: hidden;
-            margin-top: 10px;
         }
-        .progress-fill {
+        
+        .progress-container.show {
+            display: block;
+        }
+        
+        .progress-bar {
             height: 100%;
-            background: linear-gradient(90deg, #667eea, #764ba2);
             width: 0%;
-            transition: width 0.5s ease;
-            border-radius: 4px;
+            background: linear-gradient(90deg, var(--accent-color), #6f42c1);
+            border-radius: 999px;
+            transition: width 0.3s ease;
         }
-        .progress-text {
-            color: #4a5568;
-            font-size: 14px;
-            text-align: center;
-            margin-top: 8px;
-        }
-        .result-box {
-            margin-top: 20px;
-            padding: 20px;
-            border-radius: 12px;
+        
+        /* Status messages */
+        .status {
+            margin-top: 1rem;
+            padding: 0.75rem 1rem;
+            border-radius: 0.5rem;
             display: none;
+            align-items: center;
+            gap: 0.75rem;
         }
-        .result-box.success {
-            display: block;
-            background: #f0fff4;
-            border: 1px solid #c6f6d5;
-            color: #22543d;
+        
+        .status.show {
+            display: flex;
         }
-        .result-box.error {
-            display: block;
-            background: #fff5f5;
-            border: 1px solid #fed7d7;
-            color: #742a2a;
+        
+        .status.success {
+            background: #d1e7dd;
+            color: #0a3622;
         }
-        .result-box .icon {
-            font-size: 48px;
-            display: block;
-            text-align: center;
-            margin-bottom: 10px;
+        
+        .status.error {
+            background: #f8d7da;
+            color: #58151c;
         }
-        .result-box h3 {
-            text-align: center;
-            margin-bottom: 8px;
+        
+        .status.loading {
+            background: #cfe2ff;
+            color: #052c65;
         }
-        .result-box p {
-            text-align: center;
-            margin-bottom: 16px;
+        
+        .status .spinner {
+            width: 1.25rem;
+            height: 1.25rem;
+            border: 2px solid currentColor;
+            border-top-color: transparent;
+            border-radius: 50%;
+            animation: spin 0.6s linear infinite;
+            flex-shrink: 0;
         }
-        .btn {
-            display: inline-block;
-            padding: 12px 32px;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        
+        /* Download button */
+        .download-btn {
+            display: none;
+            margin-top: 1rem;
+            width: 100%;
+            padding: 0.75rem;
+            background: var(--success-color);
             color: white;
             border: none;
-            border-radius: 8px;
-            font-size: 16px;
+            border-radius: 0.5rem;
+            font-size: 1rem;
             font-weight: 600;
             cursor: pointer;
-            transition: all 0.3s ease;
-            text-decoration: none;
-            text-align: center;
+            transition: var(--transition);
+            align-items: center;
+            justify-content: center;
+            gap: 0.5rem;
         }
-        .btn:hover {
+        
+        .download-btn.show {
+            display: flex;
+        }
+        
+        .download-btn:hover {
             transform: translateY(-2px);
-            box-shadow: 0 10px 20px rgba(102, 126, 234, 0.4);
+            box-shadow: 0 0.25rem 0.5rem rgba(25, 135, 84, 0.3);
         }
-        .btn:disabled {
-            opacity: 0.6;
-            cursor: not-allowed;
-            transform: none;
-        }
-        .btn-block {
-            display: block;
-            width: 100%;
-        }
-        .btn-secondary {
-            background: #e2e8f0;
-            color: #2d3748;
-        }
-        .btn-secondary:hover {
-            background: #cbd5e0;
-            box-shadow: none;
-        }
-        .file-info {
-            margin-top: 12px;
-            font-size: 14px;
-            color: #4a5568;
-            text-align: center;
-        }
-        .features {
-            margin-top: 30px;
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 12px;
-        }
-        .feature {
-            background: #f7fafc;
-            padding: 12px;
-            border-radius: 8px;
-            text-align: center;
-            font-size: 14px;
-            color: #4a5568;
-        }
-        .feature svg {
-            width: 20px;
-            height: 20px;
-            display: block;
-            margin: 0 auto 6px;
-            color: #667eea;
-        }
+        
+        /* Responsive */
         @media (max-width: 640px) {
-            .container { padding: 20px; }
-            h1 { font-size: 24px; }
-            .features { grid-template-columns: 1fr; }
-            .upload-area { padding: 24px; }
+            .container {
+                padding: 1rem;
+            }
+            
+            .header h1 {
+                font-size: 1.75rem;
+            }
+            
+            .drop-zone {
+                padding: 2rem 1rem;
+            }
+            
+            .drop-zone .icon {
+                font-size: 3rem;
+            }
+            
+            .theme-toggle {
+                width: 2.5rem;
+                height: 2.5rem;
+                font-size: 1.25rem;
+                top: 0.75rem;
+                right: 0.75rem;
+            }
         }
     </style>
 </head>
 <body>
+    <!-- Theme toggle -->
+    <button class="theme-toggle" id="themeToggle" aria-label="Toggle theme">
+        🌙
+    </button>
+    
     <div class="container">
-        <h1>📄 PDF to Word Converter</h1>
-        <p class="subtitle">Convert PDF to editable DOCX in seconds • Supports scanned PDFs</p>
-        
-        <?php if ($result && isset($result['success'])): ?>
-        <div class="result-box success" style="display:block;">
-            <span class="icon">✅</span>
-            <h3>Conversion Complete!</h3>
-            <p><?php echo htmlspecialchars($result['message']); ?></p>
-            <a href="?download=1&file=<?php echo urlencode($result['filename']); ?>" class="btn btn-block">
-                📥 Download DOCX
-            </a>
-            <br><br>
-            <a href="<?php echo $_SERVER['PHP_SELF']; ?>" class="btn btn-secondary btn-block">Convert Another File</a>
-        </div>
-        <?php elseif ($error): ?>
-        <div class="result-box error" style="display:block;">
-            <span class="icon">❌</span>
-            <h3>Conversion Failed</h3>
-            <p><?php echo htmlspecialchars($error); ?></p>
-            <a href="<?php echo $_SERVER['PHP_SELF']; ?>" class="btn btn-block">Try Again</a>
-        </div>
-        <?php else: ?>
-        <div class="upload-area" id="dropZone">
-            <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
-            </svg>
-            <p><strong>Drop your PDF here</strong> or click to browse</p>
-            <small>Maximum file size: 100MB • Supports text and scanned PDFs</small>
-            <input type="file" id="fileInput" accept=".pdf,application/pdf" />
+        <!-- Header -->
+        <div class="header">
+            <h1>📄 PDF to Word Converter</h1>
+            <p>Upload a PDF file and convert it to an editable Word document</p>
         </div>
         
-        <div id="fileInfo" class="file-info" style="display:none;"></div>
-        
-        <div class="progress-container" id="progressContainer">
-            <div class="progress-bar">
-                <div class="progress-fill" id="progressFill"></div>
+        <!-- Drop zone -->
+        <form id="uploadForm" enctype="multipart/form-data" method="post">
+            <div class="drop-zone" id="dropZone">
+                <div class="icon">📤</div>
+                <h3>Drag &amp; drop your PDF here</h3>
+                <p>or click to browse files (Max 50MB)</p>
+                <input type="file" name="pdf_file" id="fileInput" accept=".pdf,application/pdf" required>
             </div>
-            <div class="progress-text" id="progressText">Uploading...</div>
-        </div>
-        
-        <div id="resultContainer"></div>
-        
-        <div class="features">
-            <div class="feature">
-                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
-                </svg>
-                Text PDF Support
-            </div>
-            <div class="feature">
-                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
-                </svg>
-                Scanned PDF OCR
-            </div>
-            <div class="feature">
-                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
-                </svg>
-                Secure & Private
-            </div>
-            <div class="feature">
-                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-                </svg>
-                Fast & Free
-            </div>
-        </div>
-        <?php endif; ?>
-    </div>
-
-    <script>
-        (function() {
-            'use strict';
             
+            <!-- File info -->
+            <div class="file-info" id="fileInfo">
+                <span class="name" id="fileName">file.pdf</span>
+                <span class="size" id="fileSize">0 MB</span>
+                <button type="button" id="removeFile" style="background:none;border:none;cursor:pointer;font-size:1.25rem;color:var(--text-secondary)">✕</button>
+            </div>
+            
+            <!-- Progress -->
+            <div class="progress-container" id="progressContainer">
+                <div class="progress-bar" id="progressBar"></div>
+            </div>
+            
+            <!-- Status -->
+            <div class="status" id="status">
+                <div class="spinner" id="spinner"></div>
+                <span id="statusMessage">Processing...</span>
+            </div>
+            
+            <!-- Submit button (hidden) -->
+            <input type="submit" id="submitBtn" style="display:none">
+        </form>
+        
+        <!-- Download button -->
+        <button class="download-btn" id="downloadBtn">
+            ⬇️ Download Word Document
+        </button>
+    </div>
+    
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            // Elements
             const dropZone = document.getElementById('dropZone');
             const fileInput = document.getElementById('fileInput');
-            const progressContainer = document.getElementById('progressContainer');
-            const progressFill = document.getElementById('progressFill');
-            const progressText = document.getElementById('progressText');
             const fileInfo = document.getElementById('fileInfo');
-            const resultContainer = document.getElementById('resultContainer');
+            const fileName = document.getElementById('fileName');
+            const fileSize = document.getElementById('fileSize');
+            const removeFile = document.getElementById('removeFile');
+            const progressContainer = document.getElementById('progressContainer');
+            const progressBar = document.getElementById('progressBar');
+            const status = document.getElementById('status');
+            const statusMessage = document.getElementById('statusMessage');
+            const spinner = document.getElementById('spinner');
+            const downloadBtn = document.getElementById('downloadBtn');
+            const uploadForm = document.getElementById('uploadForm');
+            const themeToggle = document.getElementById('themeToggle');
             
-            if (!dropZone || !fileInput) return;
+            let selectedFile = null;
             
-            // Drag and drop events
-            ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
-                dropZone.addEventListener(eventName, preventDefaults, false);
-            });
-            
-            function preventDefaults(e) {
-                e.preventDefault();
-                e.stopPropagation();
+            // Theme handling
+            function getTheme() {
+                return localStorage.getItem('theme') || 'light';
             }
             
-            ['dragenter', 'dragover'].forEach(eventName => {
-                dropZone.addEventListener(eventName, () => {
-                    dropZone.classList.add('dragover');
-                }, false);
+            function setTheme(theme) {
+                document.documentElement.setAttribute('data-theme', theme);
+                localStorage.setItem('theme', theme);
+                themeToggle.textContent = theme === 'dark' ? '☀️' : '🌙';
+            }
+            
+            // Initialize theme
+            setTheme(getTheme());
+            
+            themeToggle.addEventListener('click', function() {
+                const current = getTheme();
+                setTheme(current === 'dark' ? 'light' : 'dark');
             });
             
-            ['dragleave', 'drop'].forEach(eventName => {
-                dropZone.addEventListener(eventName, () => {
-                    dropZone.classList.remove('dragover');
-                }, false);
-            });
-            
-            dropZone.addEventListener('drop', handleDrop, false);
-            dropZone.addEventListener('click', () => fileInput.click(), false);
-            fileInput.addEventListener('change', (e) => {
-                if (e.target.files.length) {
-                    handleFile(e.target.files[0]);
-                }
-            });
-            
-            function handleDrop(e) {
-                const dt = e.dataTransfer;
-                const files = dt.files;
-                if (files.length) {
-                    handleFile(files[0]);
-                }
+            // File handling
+            function formatSize(bytes) {
+                if (bytes === 0) return '0 B';
+                const k = 1024;
+                const sizes = ['B', 'KB', 'MB', 'GB'];
+                const i = Math.floor(Math.log(bytes) / Math.log(k));
+                return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
             }
             
             function handleFile(file) {
-                // Validate file
-                if (file.type !== 'application/pdf' && !file.name.toLowerCase().endsWith('.pdf')) {
-                    showResult('error', '❌', 'Invalid File', 'Please select a valid PDF file.');
+                if (!file) return;
+                
+                // Validate file type
+                if (file.type !== 'application/pdf' && file.type !== 'application/x-pdf') {
+                    showStatus('error', 'Please select a valid PDF file');
                     return;
                 }
                 
-                if (file.size > 100 * 1024 * 1024) {
-                    showResult('error', '❌', 'File Too Large', 'File size exceeds 100MB limit.');
+                // Validate size
+                if (file.size > 50 * 1024 * 1024) {
+                    showStatus('error', 'File size exceeds 50MB limit');
                     return;
                 }
                 
-                // Show file info
-                fileInfo.style.display = 'block';
-                fileInfo.innerHTML = `<strong>${file.name}</strong> (${(file.size / 1024 / 1024).toFixed(2)} MB)`;
-                
-                // Upload
-                uploadFile(file);
+                selectedFile = file;
+                fileName.textContent = file.name;
+                fileSize.textContent = formatSize(file.size);
+                fileInfo.classList.add('show');
+                dropZone.style.display = 'none';
+                hideStatus();
+                downloadBtn.classList.remove('show');
             }
             
-            function uploadFile(file) {
-                const formData = new FormData();
-                formData.append('pdf_file', file);
+            function removeFile() {
+                selectedFile = null;
+                fileInfo.classList.remove('show');
+                dropZone.style.display = 'block';
+                fileInput.value = '';
+                hideStatus();
+                progressContainer.classList.remove('show');
+                downloadBtn.classList.remove('show');
+            }
+            
+            function showStatus(type, message) {
+                status.className = 'status show ' + type;
+                statusMessage.textContent = message;
+                if (type === 'loading') {
+                    spinner.style.display = 'block';
+                } else {
+                    spinner.style.display = 'none';
+                }
+            }
+            
+            function hideStatus() {
+                status.className = 'status';
+                statusMessage.textContent = '';
+                spinner.style.display = 'none';
+            }
+            
+            // Drag and drop events
+            dropZone.addEventListener('dragover', function(e) {
+                e.preventDefault();
+                this.classList.add('drag-over');
+            });
+            
+            dropZone.addEventListener('dragleave', function(e) {
+                e.preventDefault();
+                this.classList.remove('drag-over');
+            });
+            
+            dropZone.addEventListener('drop', function(e) {
+                e.preventDefault();
+                this.classList.remove('drag-over');
+                const files = e.dataTransfer.files;
+                if (files.length > 0) {
+                    handleFile(files[0]);
+                }
+            });
+            
+            fileInput.addEventListener('change', function() {
+                if (this.files.length > 0) {
+                    handleFile(this.files[0]);
+                }
+            });
+            
+            removeFile.addEventListener('click', removeFile);
+            
+            // Form submission
+            uploadForm.addEventListener('submit', function(e) {
+                e.preventDefault();
+                
+                if (!selectedFile) {
+                    showStatus('error', 'Please select a PDF file');
+                    return;
+                }
                 
                 // Show progress
-                progressContainer.style.display = 'block';
-                progressFill.style.width = '0%';
-                progressText.textContent = 'Uploading...';
+                progressContainer.classList.add('show');
+                progressBar.style.width = '0%';
+                showStatus('loading', 'Starting conversion...');
+                downloadBtn.classList.remove('show');
                 
+                // Create FormData
+                const formData = new FormData();
+                formData.append('pdf_file', selectedFile);
+                
+                // Upload with progress
                 const xhr = new XMLHttpRequest();
                 xhr.open('POST', window.location.href, true);
-                xhr.setRequestHeader('X-Requested-With', 'XMLHttpRequest');
                 
-                xhr.upload.addEventListener('progress', (e) => {
+                xhr.upload.addEventListener('progress', function(e) {
                     if (e.lengthComputable) {
-                        const percent = Math.round((e.loaded / e.total) * 100);
-                        progressFill.style.width = percent + '%';
-                        progressText.textContent = `Uploading... ${percent}%`;
+                        const percent = (e.loaded / e.total) * 100;
+                        progressBar.style.width = percent + '%';
+                        showStatus('loading', `Uploading... ${Math.round(percent)}%`);
                     }
                 });
                 
                 xhr.onload = function() {
-                    if (xhr.status === 200) {
-                        try {
-                            const response = JSON.parse(xhr.responseText);
-                            if (response.success) {
-                                progressFill.style.width = '100%';
-                                progressText.textContent = 'Conversion complete!';
-                                showResult('success', '✅', 'Conversion Complete!', response.message, response.download_url);
-                            } else {
-                                showResult('error', '❌', 'Conversion Failed', response.error || 'Unknown error occurred.');
+                    progressBar.style.width = '100%';
+                    
+                    try {
+                        const response = JSON.parse(this.responseText);
+                        
+                        if (response.success) {
+                            showStatus('success', response.message);
+                            if (response.download) {
+                                downloadBtn.classList.add('show');
+                                downloadBtn.dataset.url = response.download;
                             }
-                        } catch (e) {
-                            showResult('error', '❌', 'Error', 'Invalid response from server.');
+                            removeFile();
+                        } else {
+                            showStatus('error', response.message || 'Conversion failed');
                         }
-                    } else {
-                        showResult('error', '❌', 'Server Error', 'Failed to process request. Please try again.');
+                    } catch (e) {
+                        showStatus('error', 'An unexpected error occurred');
+                        console.error('Response parse error:', e);
                     }
+                    
+                    setTimeout(() => {
+                        progressContainer.classList.remove('show');
+                    }, 1000);
                 };
                 
                 xhr.onerror = function() {
-                    showResult('error', '❌', 'Network Error', 'Failed to connect to server. Please check your connection.');
+                    showStatus('error', 'Network error occurred. Please try again.');
+                    progressContainer.classList.remove('show');
                 };
                 
                 xhr.send(formData);
-            }
+            });
             
-            function showResult(type, icon, title, message, downloadUrl) {
-                resultContainer.style.display = 'block';
-                resultContainer.className = 'result-box ' + type;
-                resultContainer.innerHTML = `
-                    <span class="icon">${icon}</span>
-                    <h3>${title}</h3>
-                    <p>${message}</p>
-                    ${downloadUrl ? `<a href="${downloadUrl}" class="btn btn-block">📥 Download DOCX</a>` : ''}
-                    ${!downloadUrl ? `<a href="${window.location.href}" class="btn btn-secondary btn-block">Try Again</a>` : ''}
-                `;
-                
-                // Hide progress
-                if (type === 'success' || type === 'error') {
+            // Download handler
+            downloadBtn.addEventListener('click', function() {
+                const url = this.dataset.url;
+                if (url) {
+                    window.location.href = url;
                     setTimeout(() => {
-                        progressContainer.style.display = 'none';
+                        this.classList.remove('show');
+                        showStatus('success', 'Download complete!');
                     }, 1000);
                 }
-            }
-        })();
+            });
+            
+            // Click on drop zone to trigger file input
+            dropZone.addEventListener('click', function(e) {
+                if (e.target.tagName !== 'INPUT') {
+                    fileInput.click();
+                }
+            });
+        });
     </script>
 </body>
 </html>
