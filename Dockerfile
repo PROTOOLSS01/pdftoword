@@ -1,72 +1,98 @@
+# Use official PHP 8.3 image with Apache
 FROM php:8.3-apache
 
-ENV DEBIAN_FRONTEND=noninteractive
-
-# Install system packages
+# Install system dependencies and tools
 RUN apt-get update && apt-get install -y \
+    # LibreOffice for PDF to DOCX conversion
     libreoffice \
     libreoffice-writer \
+    # Poppler Utils for PDF to image conversion
     poppler-utils \
+    # Tesseract OCR
     tesseract-ocr \
-    ghostscript \
+    tesseract-ocr-eng \
+    # PHP extensions dependencies
+    libzip-dev \
+    libxml2-dev \
+    libpng-dev \
+    libjpeg-dev \
+    libfreetype6-dev \
+    # Additional tools
     unzip \
-    zip \
     git \
     curl \
-    wget \
-    libzip-dev \
-    libpng-dev \
-    libjpeg62-turbo-dev \
-    libfreetype6-dev \
-    libxml2-dev \
-    libonig-dev \
-    && docker-php-ext-configure gd --with-freetype --with-jpeg \
-    && docker-php-ext-install \
-        gd \
-        zip \
-        mbstring \
-        xml \
-    && a2enmod rewrite \
+    # Clean up
     && rm -rf /var/lib/apt/lists/*
 
-# Install Composer
-COPY --from=composer:2 /usr/bin/composer /usr/bin/composer
+# Install PHP extensions
+RUN docker-php-ext-configure gd --with-freetype --with-jpeg \
+    && docker-php-ext-install -j$(nproc) \
+    gd \
+    zip \
+    xml \
+    mbstring \
+    pcntl
 
+# Enable Apache mod_rewrite
+RUN a2enmod rewrite
+
+# Install Composer
+COPY --from=composer:2.7 /usr/bin/composer /usr/bin/composer
+
+# Set working directory
 WORKDIR /var/www/html
 
-# Copy composer files
-COPY composer.json ./
+# Copy composer files first for better caching
+COPY composer.json composer.lock ./
 
-# Install dependencies
-RUN composer clear-cache
+# Install PHP dependencies
+RUN composer install --no-dev --optimize-autoloader --no-interaction --no-progress
 
-RUN composer install \
-    --no-dev \
-    --prefer-dist \
-    --optimize-autoloader \
-    --no-interaction \
-    --ignore-platform-reqs
-
-# Copy project
+# Copy application files
 COPY . .
 
-# Create folders
-RUN mkdir -p \
-    uploads \
-    output \
-    temp
+# Set permissions
+RUN chown -R www-data:www-data /var/www/html \
+    && chmod -R 755 /var/www/html \
+    && chmod -R 775 /var/www/html/uploads \
+    && chmod -R 775 /var/www/html/output \
+    && chmod -R 775 /var/www/html/temp
 
-RUN chmod -R 777 \
-    uploads \
-    output \
-    temp
+# Create directories with proper permissions
+RUN mkdir -p /var/www/html/uploads /var/www/html/output /var/www/html/temp \
+    && chown -R www-data:www-data /var/www/html/uploads \
+    && chown -R www-data:www-data /var/www/html/output \
+    && chown -R www-data:www-data /var/www/html/temp \
+    && chmod -R 775 /var/www/html/uploads \
+    && chmod -R 775 /var/www/html/output \
+    && chmod -R 775 /var/www/html/temp
 
-# Apache
-ENV APACHE_DOCUMENT_ROOT=/var/www/html
+# Configure PHP
+RUN echo "upload_max_filesize = 50M" > /usr/local/etc/php/conf.d/uploads.ini \
+    && echo "post_max_size = 50M" >> /usr/local/etc/php/conf.d/uploads.ini \
+    && echo "max_execution_time = 300" >> /usr/local/etc/php/conf.d/uploads.ini \
+    && echo "memory_limit = 256M" >> /usr/local/etc/php/conf.d/uploads.ini
 
-RUN sed -ri -e 's!/var/www/html!${APACHE_DOCUMENT_ROOT}!g' \
-    /etc/apache2/sites-available/*.conf
+# Configure Apache
+RUN echo "ServerName localhost" >> /etc/apache2/apache2.conf \
+    && echo "<Directory /var/www/html>" >> /etc/apache2/apache2.conf \
+    && echo "    Options Indexes FollowSymLinks" >> /etc/apache2/apache2.conf \
+    && echo "    AllowOverride All" >> /etc/apache2/apache2.conf \
+    && echo "    Require all granted" >> /etc/apache2/apache2.conf \
+    && echo "</Directory>" >> /etc/apache2/apache2.conf
 
+# Set proper timezone
+RUN echo "date.timezone = UTC" > /usr/local/etc/php/conf.d/timezone.ini
+
+# Clean up
+RUN apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Expose port 80
 EXPOSE 80
 
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost/ || exit 1
+
+# Start Apache
 CMD ["apache2-foreground"]
